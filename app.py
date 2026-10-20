@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from functools import partial
 from threading import Thread
 
 import pandas as pd
@@ -385,12 +386,41 @@ def render_notification_sidebar():
     }
 
 
+def select_stock_for_analysis(table, table_key):
+    rows = st.session_state[table_key]["selection"]["rows"]
+    if not rows:
+        return
+    symbol = normalize_symbol(table.iloc[rows[0]]["Symbol"])
+    st.session_state["analysis_symbol"] = symbol
+    st.session_state["main_tab"] = "Stock Analysis"
+    st.session_state["analysis_requested"] = True
+    st.session_state.pop("analysis", None)
+    st.session_state["stock_table_version"] = (
+        st.session_state.get("stock_table_version", 0) + 1
+    )
+
+
+def render_stock_table(table, formats, key):
+    table_key = f"{key}-{st.session_state.get('stock_table_version', 0)}"
+    st.caption("Click a row to open that stock in Stock Analysis.")
+    st.dataframe(
+        table.style.format(formats, na_rep="N/A"),
+        hide_index=True,
+        use_container_width=True,
+        key=table_key,
+        selection_mode="single-row",
+        on_select=partial(select_stock_for_analysis, table, table_key),
+    )
+
+
 def render_analysis_tab():
     st.subheader("Stock research")
+    st.session_state.setdefault("analysis_symbol", "TCS.NS")
+    analysis_requested = st.session_state.pop("analysis_requested", False)
     input_column, button_column = st.columns([4, 1])
     symbol_input = input_column.text_input(
         "NSE/Yahoo symbol",
-        "TCS.NS",
+        key="analysis_symbol",
         help="The .NS suffix is added automatically when omitted.",
     )
     analyze = button_column.button(
@@ -399,7 +429,7 @@ def render_analysis_tab():
         use_container_width=True,
     )
 
-    if analyze:
+    if analyze or analysis_requested:
         symbol = normalize_symbol(symbol_input)
         if not symbol:
             st.error("Enter a stock symbol.")
@@ -834,22 +864,19 @@ def render_watchlist_tab(credentials):
         "High data is absent. Dividend adjustments are not included. "
         "N/A means there is not enough price history."
     )
-    st.dataframe(
-        report.style.format(
-            {
-                "Price": "₹{:,.2f}",
-                "20D Support": "₹{:,.2f}",
-                "60D Support": "₹{:,.2f}",
-                "1M Return %": "{:+.2f}%",
-                "1Y Return %": "{:+.2f}%",
-                "From All-Time High %": "{:+.2f}%",
-                "RSI": "{:.2f}",
-                "6M Return %": "{:.2f}%",
-            },
-            na_rep="N/A",
-        ),
-        hide_index=True,
-        use_container_width=True,
+    render_stock_table(
+        report,
+        {
+            "Price": "₹{:,.2f}",
+            "20D Support": "₹{:,.2f}",
+            "60D Support": "₹{:,.2f}",
+            "1M Return %": "{:+.2f}%",
+            "1Y Return %": "{:+.2f}%",
+            "From All-Time High %": "{:+.2f}%",
+            "RSI": "{:.2f}",
+            "6M Return %": "{:.2f}%",
+        },
+        key="watchlist-table",
     )
     report_text = format_report(report)
     with st.expander("Alert preview"):
@@ -910,17 +937,14 @@ def render_top_picks_tab():
     if picks is None:
         return
     st.caption(f"Universe source: {st.session_state['top_picks_source']}")
-    st.dataframe(
-        picks.style.format(
-            {
-                "Price": "₹{:,.2f}",
-                "RSI": "{:.2f}",
-                "6M Return %": "{:.2f}%",
-            },
-            na_rep="N/A",
-        ),
-        hide_index=True,
-        use_container_width=True,
+    render_stock_table(
+        picks,
+        {
+            "Price": "₹{:,.2f}",
+            "RSI": "{:.2f}",
+            "6M Return %": "{:.2f}%",
+        },
+        key="top-picks-table",
     )
 
 
@@ -994,21 +1018,18 @@ def render_quality_screen_tab():
         st.info("No companies currently meet every quality-screen rule.")
         return
 
-    st.dataframe(
-        companies.style.format(
-            {
-                "Price": "₹{:,.2f}",
-                "Market Cap (Cr)": "₹{:,.2f} Cr",
-                "Sales QoQ %": "{:.2f}%",
-                "Profit QoQ %": "{:.2f}%",
-                "RSI": "{:.2f}",
-                "6M Return %": "{:.2f}%",
-                "Technical Score": "{:.2f}",
-            },
-            na_rep="N/A",
-        ),
-        hide_index=True,
-        use_container_width=True,
+    render_stock_table(
+        companies,
+        {
+            "Price": "₹{:,.2f}",
+            "Market Cap (Cr)": "₹{:,.2f} Cr",
+            "Sales QoQ %": "{:.2f}%",
+            "Profit QoQ %": "{:.2f}%",
+            "RSI": "{:.2f}",
+            "6M Return %": "{:.2f}%",
+            "Technical Score": "{:.2f}",
+        },
+        key="quality-screen-table",
     )
 
 
@@ -1226,7 +1247,9 @@ notification_credentials = render_notification_sidebar()
         "Top 10 Picks",
         "Quality Screen",
         "IPO Screening",
-    ]
+    ],
+    key="main_tab",
+    on_change="rerun",
 )
 
 with analysis_tab:
