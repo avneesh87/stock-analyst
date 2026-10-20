@@ -55,6 +55,7 @@ class OpenIPO:
     sector_peer_count: int = 0
     gmp: GMPQuote | None = None
     gmp_url: str | None = None
+    allotment_date: date | None = None
 
 
 @dataclass
@@ -76,7 +77,10 @@ def _number(text: str) -> float | None:
 
 
 def _period(text: str) -> date | None:
-    for pattern in ("%d %b %Y", "%b %d, %Y", "%d %B %Y"):
+    for pattern in (
+        "%d %b %Y", "%b %d, %Y", "%d %B %Y",
+        "%a, %b %d, %Y", "%A, %B %d, %Y",
+    ):
         try:
             return datetime.strptime(text.strip(), pattern).date()
         except ValueError:
@@ -344,6 +348,18 @@ def parse_ipo_detail(
     listing = details.get("Listing At", "")
     if "SME" in listing.upper() or not re.search(r"\b(BSE|NSE)\b", listing):
         raise StockDataError("Mainboard listing could not be verified on the detail page.")
+    allotment_date = None
+    for label in ("Basis of Allotment", "Allotment Date", "Allotment"):
+        allotment_date = _period(details.get(label, ""))
+        if allotment_date is not None:
+            break
+    if allotment_date is None:
+        for row in soup.select("li"):
+            cells = row.find_all("span", recursive=False)
+            if len(cells) == 2 and cells[0].get_text(" ", strip=True) == "Allotment":
+                allotment_date = _period(cells[1].get_text(" ", strip=True))
+                if allotment_date is not None:
+                    break
     sector, peer_pe, peer_count = _sector_context(soup)
     assessment = assess_ipo_fundamentals(
         financials, market_cap, sector=sector, peer_pe=peer_pe,
@@ -382,6 +398,7 @@ def parse_ipo_detail(
         sector_peer_pe=peer_pe,
         sector_peer_count=peer_count,
         gmp_url=gmp_url,
+        allotment_date=allotment_date,
     )
 
 
@@ -420,6 +437,8 @@ def screen_open_mainboard_ipos(
         if not isinstance(item, dict) or not isinstance(item.get("ipo_status"), str):
             raise StockDataError("Chittorgarh IPO feed contains an invalid status row.")
         status = item["ipo_status"].strip().lower()
+        if status == "current":
+            status = "open"
         if status != "open" and not (include_upcoming and status == "upcoming"):
             continue
         name = str(item.get("company_name") or "Unnamed IPO")

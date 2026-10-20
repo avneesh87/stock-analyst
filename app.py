@@ -1051,6 +1051,44 @@ def render_ipo_screen_tab():
             st.info("No open or upcoming mainboard IPOs are currently available.")
         return
 
+    st.markdown("### Open and upcoming IPO summary")
+    summary = pd.DataFrame([
+        {
+            "Company name": issue.name,
+            "Status": issue.status,
+            "GMP (%)": issue.gmp.percentage if issue.gmp is not None else None,
+            "GMP (INR)": issue.gmp.premium if issue.gmp is not None else None,
+            "Price band": issue.price_band,
+            "Opening date": issue.opens.strftime("%d %b %Y") if issue.opens else "Unconfirmed",
+            "Closing date": issue.closes.strftime("%d %b %Y") if issue.closes else "Unconfirmed",
+            "Allotment date": (
+                issue.allotment_date.strftime("%d %b %Y")
+                if issue.allotment_date else "Unavailable"
+            ),
+        }
+        for issue in report.issues
+    ])
+    st.dataframe(
+        summary.style.format(
+            {"GMP (INR)": "₹{:+,.2f}", "GMP (%)": "{:+.2f}%"},
+            na_rep="Unavailable",
+        ).map(
+            lambda value: (
+                "" if pd.isna(value) or value == 0
+                else "color: green" if value > 0 else "color: red"
+            ),
+            subset=["GMP (INR)", "GMP (%)"],
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(
+        "GMP is an unofficial premium per share, not the IPO offer price. "
+        "Green = positive, red = negative; zero and unavailable quotes are neutral. "
+        "GMP percentages are source-reported. Allotment dates are tentative; "
+        "unpublished or unreadable dates are shown as unavailable."
+    )
+
     st.info(
         "APPLY CANDIDATE means all six screening checks passed, not a guarantee "
         "or personalized advice. CAUTION means mixed or incomplete evidence. "
