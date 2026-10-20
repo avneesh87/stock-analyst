@@ -125,16 +125,19 @@ def assess_ipo_fundamentals(
         if isinstance(column, date) and (column.month, column.day) == (3, 31)
     ]
     annual.sort(reverse=True)
-    if len(annual) < 2 or annual[0].year - annual[1].year != 1:
+    if not annual:
         return IPOAssessment(
             "CAUTION", [], ["Two consecutive March year-end financials are required."],
             metrics,
         )
 
-    latest, previous = annual[:2]
+    latest = annual[0]
+    previous = annual[1] if len(annual) > 1 and latest.year - annual[1].year == 1 else None
+    if previous is None:
+        risks.append("Two consecutive March year-end financials are required for growth checks.")
 
-    def value(label: str, period: date) -> float | None:
-        if label not in financials.index:
+    def value(label: str, period: date | None) -> float | None:
+        if period is None or label not in financials.index:
             return None
         raw = financials.at[label, period]
         if pd.isna(raw):

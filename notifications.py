@@ -18,12 +18,38 @@ def format_report(report: pd.DataFrame) -> str:
     lines = ["Indian Stock Watchlist", ""]
     for row in report.to_dict("records"):
         trend = "Above" if row["Above 200 DMA"] else "Below"
+        support_values = []
+        for label in ("20D Support", "60D Support"):
+            value = row.get(label)
+            formatted = "N/A" if pd.isna(value) else f"INR {value:.2f}"
+            support_values.append(f"{label} {formatted}")
+        support_text = " | ".join(support_values)
+        high_values = []
+        for label in ("1M Return %", "1Y Return %", "From All-Time High %"):
+            value = row.get(label)
+            formatted = "N/A" if pd.isna(value) else f"{value:+.2f}%"
+            high_values.append(f"{label.removesuffix(' %')} {formatted}")
+        high_text = " | ".join(high_values)
+        rsi_text = "N/A" if pd.isna(row["RSI"]) else f"{row['RSI']:.2f}"
+        return_text = "N/A" if pd.isna(row["6M Return %"]) else f"{row['6M Return %']:.2f}%"
         lines.append(
             f"{row['Symbol']}: INR {row['Price']:.2f} | "
-            f"RSI {row['RSI']:.2f} | 6M {row['6M Return %']:.2f}% | "
+            f"Price date {row.get('Price Date', 'N/A')} | "
+            f"6M reference {row.get('6M Reference Date') or 'N/A'} | "
+            f"1Y reference {row.get('1Y Reference Date') or 'N/A'} | "
+            f"{support_text} | "
+            f"{high_text} | "
+            f"RSI {rsi_text} | 6M {return_text} | "
             f"{trend} 200 DMA | Score {row['Technical Score']}/100"
         )
     lines.append("")
+    lines.append(
+        "Price returns exclude dividends: latest close / reference close - 1. "
+        "1M looks back from the latest price date; 6M/1Y from today's India date. "
+        "If the latest quote is older than today, 6M/1Y span less than their named periods. "
+        "All-time-high distance uses "
+        "available unadjusted Yahoo history."
+    )
     lines.append("Generated from live online market data. Not financial advice.")
     return "\n".join(lines)
 

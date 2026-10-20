@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
 from io import StringIO
 import math
+import re
+from urllib.parse import quote, urljoin
+from zoneinfo import ZoneInfo
 
+from bs4 import BeautifulSoup
 import feedparser
 import pandas as pd
 import requests
@@ -232,28 +237,132 @@ def news_sentiment(news: list[dict[str, str]]) -> dict[str, object]:
     return {"overall": overall, "score": total, "headlines": details}
 
 
-def _statement_values(statement: pd.DataFrame, row_name: str) -> list[float]:
+def _statement_values(statement: pd.DataFrame, row_name: str) -> list[float | None]:
     if statement.empty or row_name not in statement.index:
         return []
 
     values = []
-    for raw_value in statement.loc[row_name].tolist():
+    for raw_value in statement.sort_index(axis=1, ascending=False).loc[row_name].tolist():
         try:
             value = float(raw_value)
         except (TypeError, ValueError):
-            continue
-        if math.isfinite(value):
-            values.append(value)
+            values.append(None)
+        else:
+            values.append(value if math.isfinite(value) else None)
     return values
+
+
+def _ttm_income(
+    statement: pd.DataFrame, annual: pd.DataFrame | None = None,
+) -> tuple[float | None, str | None, str]:
+    statement = statement.sort_index(axis=1, ascending=False)
+    row = (
+        "Net Income Common Stockholders"
+        if "Net Income Common Stockholders" in statement.index
+        else "Net Income"
+    )
+    periods = pd.DatetimeIndex(statement.columns[:4])
+    values = _statement_values(statement.iloc[:, :4], row)
+    valid_quarters = (
+        len(periods) == 4 and len(values) == 4
+        and not periods.has_duplicates
+        and all(value is not None for value in values)
+        and all(70 <= (periods[i] - periods[i + 1]).days <= 110 for i in range(3))
+    )
+    total = sum(value for value in values if value is not None) if valid_quarters else None
+    basis = f"Market cap / four-quarter {row}"
+    if total is None and annual is not None and not annual.empty and len(periods):
+        annual = annual.sort_index(axis=1, ascending=False)
+        annual_values = _statement_values(annual, row)
+        year_end = pd.Timestamp(annual.columns[0])
+        latest = periods[0]
+        # FY + current YTD - prior YTD is equivalent to four consecutive quarters.
+        current_ytd = []
+        prior_ytd = []
+        ytd_end = None
+        for offset in (3, 6, 9):
+            expected = year_end + pd.DateOffset(months=offset)
+            if expected > latest + pd.Timedelta(days=7):
+                break
+            ytd_end = expected
+            for target, output in (
+                (expected, current_ytd),
+                (expected - pd.DateOffset(years=1), prior_ytd),
+            ):
+                matches = [
+                    column for column in statement.columns
+                    if abs((pd.Timestamp(column) - target).days) <= 7
+                ]
+                matched_values = _statement_values(statement[matches], row)
+                output.append(matched_values[0] if len(matched_values) == 1 else None)
+        if (
+            annual_values and annual_values[0] is not None
+            and current_ytd and all(value is not None for value in current_ytd + prior_ytd)
+            and ytd_end is not None and abs((ytd_end - latest).days) <= 7
+        ):
+            total = annual_values[0] + sum(
+                value for value in current_ytd if value is not None
+            ) - sum(value for value in prior_ytd if value is not None)
+            basis = f"Market cap / {row} (latest FY + current YTD - prior YTD)"
+        elif annual_values and annual_values[0] is not None and latest == year_end:
+            total = annual_values[0]
+            basis = f"Market cap / latest fiscal-year {row} (FY end equals TTM end)"
+    if total is None:
+        return None, None, (
+            "TTM P/E unavailable: missing/non-consecutive quarterly profits "
+            "and insufficient annual/YTD data."
+        )
+    period = str(periods[0].date())
+    if total <= 0:
+        return None, period, "TTM P/E not meaningful: trailing four-quarter earnings are non-positive."
+    return total, period, f"{basis}; quarter ended {period}."
+
+
+def _financial_currencies(
+    stock: yf.Ticker, symbol: str,
+) -> tuple[dict[tuple[str, str], tuple[str, float]], str]:
+    metrics = [
+        "annualTotalRevenue", "annualNetIncome", "annualNetIncomeCommonStockholders",
+        "quarterlyNetIncome", "quarterlyNetIncomeCommonStockholders",
+        "annualStockholdersEquity", "annualTotalDebt", "annualFreeCashFlow",
+    ]
+    now = pd.Timestamp.now(tz="UTC")
+    try:
+        response = stock.session.get(
+            "https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/"
+            f"finance/timeseries/{quote(symbol, safe='')}",
+            params={
+                "symbol": symbol, "type": ",".join(metrics),
+                "period1": int((now - pd.DateOffset(years=6)).timestamp()),
+                "period2": int(now.timestamp()),
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()["timeseries"]
+        if payload.get("error") or not isinstance(payload.get("result"), list):
+            raise ValueError("missing financial currency series")
+        currencies = {}
+        for series in payload["result"]:
+            for metric in metrics:
+                for item in series.get(metric, []):
+                    currency = item.get("currencyCode")
+                    value = float(item["reportedValue"]["raw"])
+                    if isinstance(currency, str) and re.fullmatch(r"[A-Z]{3}", currency) and math.isfinite(value):
+                        currencies[(metric, item["asOfDate"])] = (currency, value)
+        return currencies, ""
+    except (CurlRequestException, KeyError, TypeError, ValueError) as exc:
+        return {}, f"Financial currency verification failed: {exc}. Currency-dependent values withheld."
 
 
 def get_stock_data(symbol: str) -> dict[str, float | str | None]:
     symbol = normalize_symbol(symbol)
     try:
         stock = yf.Ticker(symbol)
-        history = stock.history(period="5d")
+        history = stock.history(period="5d", auto_adjust=False)
         fast_info = dict(stock.fast_info)
         income = stock.income_stmt
+        quarterly_income = stock.quarterly_income_stmt
         balance = stock.balance_sheet
         cash_flow = stock.cashflow
     except (CurlRequestException, YFException, KeyError, TypeError, ValueError) as exc:
@@ -262,8 +371,32 @@ def get_stock_data(symbol: str) -> dict[str, float | str | None]:
     if history.empty:
         raise StockDataError(f"No online market data was found for '{symbol}'.")
 
+    currencies, currency_note = _financial_currencies(stock, symbol)
+
+    def reporting_currency(frame: pd.DataFrame, row: str, frequency: str, count: int) -> str | None:
+        frame = frame.sort_index(axis=1, ascending=False).iloc[:, :count]
+        values = _statement_values(frame, row)
+        found = set()
+        for column, value in zip(frame.columns, values):
+            if value is None:
+                continue
+            metadata = currencies.get((frequency + row.replace(" ", ""), str(column.date())))
+            if metadata is None or not math.isclose(metadata[1], value, rel_tol=1e-9, abs_tol=0.01):
+                return None
+            found.add(metadata[0])
+        return next(iter(found)) if len(found) == 1 else None
+
+    income = income.sort_index(axis=1, ascending=False)
+    if not income.empty:
+        periods = income.columns
+        balance = balance.reindex(columns=periods)
+        cash_flow = cash_flow.reindex(columns=periods)
     revenue = _statement_values(income, "Total Revenue")
-    net_income = _statement_values(income, "Net Income")
+    profit_row = (
+        "Net Income Common Stockholders"
+        if "Net Income Common Stockholders" in income.index else "Net Income"
+    )
+    net_income = _statement_values(income, profit_row)
     equity = _statement_values(balance, "Stockholders Equity")
     debt = _statement_values(balance, "Total Debt")
     free_cash_flow = _statement_values(cash_flow, "Free Cash Flow")
@@ -271,38 +404,96 @@ def get_stock_data(symbol: str) -> dict[str, float | str | None]:
     latest_revenue = revenue[0] if revenue else None
     latest_income = net_income[0] if net_income else None
     latest_equity = equity[0] if equity else None
+    ttm_income, ttm_period, pe_note = _ttm_income(quarterly_income, income)
+    income_currency = reporting_currency(income, profit_row, "annual", 1)
+    revenue_currency = reporting_currency(income, "Total Revenue", "annual", 1)
+    growth_currency = reporting_currency(income, "Total Revenue", "annual", 2)
+    equity_currency = reporting_currency(balance, "Stockholders Equity", "annual", 1)
+    debt_currency = reporting_currency(balance, "Total Debt", "annual", 1)
+    cash_currency = reporting_currency(cash_flow, "Free Cash Flow", "annual", 1)
+    quarterly_profit_row = (
+        "Net Income Common Stockholders"
+        if "Net Income Common Stockholders" in quarterly_income.index else "Net Income"
+    )
+    ttm_currency = reporting_currency(
+        quarterly_income, quarterly_profit_row, "quarterly", len(quarterly_income.columns),
+    )
+    if not income.empty and ttm_currency != income_currency:
+        ttm_currency = None
+    quote_currency = fast_info.get("currency")
+    same_currency = isinstance(quote_currency, str) and ttm_currency == quote_currency
+    if not same_currency:
+        pe_note = (
+            f"TTM P/E withheld: quote currency {quote_currency or 'unverified'}, "
+            f"earnings currency {ttm_currency or 'unverified'}. No assumed FX conversion."
+        )
+    notes = [currency_note] if currency_note else []
+    if not same_currency:
+        notes.append(pe_note)
+    if not income_currency or not growth_currency or not equity_currency or not debt_currency or not cash_currency:
+        notes.append("Some statement currencies could not be verified; affected financial values are unavailable.")
+    if cash_currency and cash_currency != "INR":
+        notes.append(f"Free cash flow is reported in {cash_currency}, not INR.")
+    valid_market_cap = (
+        isinstance(market_cap, (int, float))
+        and math.isfinite(market_cap) and market_cap > 0
+    )
+    if not valid_market_cap:
+        pe_note = "TTM P/E unavailable: valid market capitalization is missing."
+    consecutive_years = (
+        len(income.columns) >= 2
+        and 330 <= (income.columns[0] - income.columns[1]).days <= 400
+    )
 
     return {
         "Company": symbol,
+        "Price Date": str(history.index[-1].date()) if isinstance(history.index, pd.DatetimeIndex) else None,
+        "Quote Currency": quote_currency,
+        "Financial Currency": income_currency,
+        "Revenue Currency": growth_currency,
+        "Free Cash Flow Currency": cash_currency,
+        "Data Note": " ".join(notes),
+        "Financial Period": str(income.columns[0].date()) if not income.empty else None,
         "Price": float(history["Close"].iloc[-1]),
         "Market Cap": market_cap,
         "Market Cap (Cr)": to_crore(market_cap),
         "PE": (
+            market_cap / ttm_income
+            if valid_market_cap and same_currency and ttm_income is not None else None
+        ),
+        "TTM Period": ttm_period,
+        "PE Note": pe_note,
+        "Annual PE": (
             market_cap / latest_income
-            if market_cap and latest_income and latest_income > 0
+            if valid_market_cap and income_currency == quote_currency
+            and income_currency is not None and latest_income and latest_income > 0
             else None
         ),
         "ROE": (
             latest_income / latest_equity
-            if latest_income and latest_equity and latest_equity > 0
+            if income_currency is not None and income_currency == equity_currency
+            and latest_income is not None and latest_equity is not None and latest_equity > 0
             else None
         ),
         "DebtEquity": (
             debt[0] / latest_equity * 100
-            if debt and latest_equity and latest_equity > 0
+            if debt_currency is not None and debt_currency == equity_currency
+            and debt and debt[0] is not None and latest_equity is not None and latest_equity > 0
             else None
         ),
         "RevenueGrowth": (
             (revenue[0] / revenue[1]) - 1
-            if len(revenue) > 1 and revenue[1] != 0
+            if growth_currency is not None and consecutive_years and len(revenue) > 1 and revenue[0] is not None
+            and revenue[1] is not None and revenue[1] > 0
             else None
         ),
         "ProfitMargin": (
             latest_income / latest_revenue
-            if latest_income and latest_revenue and latest_revenue > 0
+            if income_currency is not None and income_currency == revenue_currency
+            and latest_income is not None and latest_revenue is not None and latest_revenue > 0
             else None
         ),
-        "FreeCashFlow": free_cash_flow[0] if free_cash_flow else None,
+        "FreeCashFlow": free_cash_flow[0] if cash_currency and free_cash_flow else None,
     }
 
 
@@ -412,10 +603,12 @@ def build_recommendation(
     }
 
 
-def get_price_history(symbol: str, period: str = "1y") -> pd.DataFrame:
+def get_price_history(
+    symbol: str, period: str = "1y", *, auto_adjust: bool = False,
+) -> pd.DataFrame:
     symbol = normalize_symbol(symbol)
     try:
-        history = yf.Ticker(symbol).history(period=period, auto_adjust=True)
+        history = yf.Ticker(symbol).history(period=period, auto_adjust=auto_adjust)
     except (CurlRequestException, YFException, KeyError, TypeError, ValueError) as exc:
         raise StockDataError(f"Could not retrieve price history for {symbol}: {exc}") from exc
     if history.empty:
@@ -423,14 +616,46 @@ def get_price_history(symbol: str, period: str = "1y") -> pd.DataFrame:
     return history
 
 
+def _calendar_return(
+    close: pd.Series, months: int, *, as_of: date | None = None,
+) -> float | None:
+    close = close.sort_index()
+    dates = close.index.normalize()
+    anchor = pd.Timestamp(as_of, tz=dates.tz) if as_of is not None else dates[-1]
+    target = anchor - pd.DateOffset(months=months)
+    earlier = close.loc[dates <= target]
+    previous = float(earlier.iloc[-1]) if not earlier.empty else None
+    current = float(close.iloc[-1])
+    if (
+        previous is None or not math.isfinite(previous) or previous <= 0
+        or not math.isfinite(current) or current <= 0
+    ):
+        return None
+    return (current / previous - 1) * 100
+
+
 def calculate_technicals(history: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(history.index, pd.DatetimeIndex):
+        history = history.sort_index()
     result = history[["Close"]].copy()
     close = result["Close"]
     delta = close.diff()
-    average_gain = delta.clip(lower=0).rolling(14).mean()
-    average_loss = -delta.clip(upper=0).rolling(14).mean()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    # Seed Wilder smoothing with the first 14 changes, then recurse.
+    average_gain = gains.copy()
+    average_loss = losses.copy()
+    if len(close) > 14:
+        average_gain.iloc[14] = gains.iloc[1:15].mean()
+        average_loss.iloc[14] = losses.iloc[1:15].mean()
+    average_gain.iloc[:14] = float("nan")
+    average_loss.iloc[:14] = float("nan")
+    average_gain = average_gain.ewm(alpha=1 / 14, adjust=False, ignore_na=True).mean()
+    average_loss = average_loss.ewm(alpha=1 / 14, adjust=False, ignore_na=True).mean()
     relative_strength = average_gain / average_loss.replace(0, float("nan"))
     result["RSI"] = 100 - (100 / (1 + relative_strength))
+    result.loc[(average_loss == 0) & (average_gain > 0), "RSI"] = 100.0
+    result.loc[(average_loss == 0) & (average_gain == 0), "RSI"] = 50.0
     result["MACD"] = close.ewm(span=12, adjust=False).mean() - close.ewm(
         span=26, adjust=False
     ).mean()
@@ -476,9 +701,11 @@ def technical_snapshot(history: pd.DataFrame) -> dict[str, float | bool | None]:
         if pd.notna(latest["60D Resistance"])
         else None
     )
-    lookback_index = max(0, len(technicals) - 126)
-    old_close = float(technicals["Close"].iloc[lookback_index])
-    six_month_return = (close / old_close - 1) * 100 if old_close else None
+    if isinstance(technicals.index, pd.DatetimeIndex):
+        six_month_return = _calendar_return(technicals["Close"], 6)
+    else:
+        old_close = float(technicals["Close"].iloc[-127]) if len(technicals) > 126 else None
+        six_month_return = (close / old_close - 1) * 100 if old_close is not None and old_close > 0 else None
 
     score = 0
     if dma_200 is not None and close > dma_200:
@@ -592,66 +819,103 @@ def technical_entry_zone(
     }
 
 
-def get_industry_pe(
-    symbol: str,
-    max_peers: int = 10,
-) -> tuple[float | None, str]:
+def get_industry_pe(symbol: str) -> tuple[float | None, str]:
     normalized_symbol = normalize_symbol(symbol)
     base_symbol = normalized_symbol.removesuffix(".NS")
-    universe, source = get_nifty50_universe()
-    match = universe[universe["Symbol"] == base_symbol]
-    if match.empty:
-        return None, "Available only for stocks in the Nifty 50 peer universe."
+    if not normalized_symbol.endswith(".NS") or not re.fullmatch(r"[A-Z0-9&_-]+", base_symbol):
+        return None, "Industry P/E lookup supports NSE equity symbols only."
+    origin = "https://www.screener.in"
 
-    industry = str(match.iloc[0]["Industry"])
-    peer_symbols = universe.loc[
-        (universe["Industry"] == industry) & (universe["Symbol"] != base_symbol),
-        "Symbol",
-    ].tolist()[:max_peers]
-    if not peer_symbols:
-        return None, f"No other {industry} companies were found in the peer universe."
+    def load_page(url: str) -> BeautifulSoup:
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise StockDataError(f"Industry P/E source could not load {url}: {exc}") from exc
+        return BeautifulSoup(response.text, "html.parser")
 
-    def peer_pe(peer_symbol: str) -> float | None:
-        ticker = yf.Ticker(normalize_symbol(peer_symbol))
-        market_cap = dict(ticker.fast_info).get("marketCap")
-        net_income = _statement_values(ticker.income_stmt, "Net Income")
-        if (
-            isinstance(market_cap, (int, float))
-            and math.isfinite(market_cap)
-            and market_cap > 0
-            and net_income
-            and net_income[0] > 0
-        ):
-            return market_cap / net_income[0]
-        return None
-
-    peer_values = []
-    with ThreadPoolExecutor(max_workers=min(8, len(peer_symbols))) as executor:
-        futures = {
-            executor.submit(peer_pe, peer_symbol): peer_symbol
-            for peer_symbol in peer_symbols
-        }
-        for future in as_completed(futures):
-            try:
-                value = future.result()
-            except (
-                CurlRequestException,
-                YFException,
-                KeyError,
-                TypeError,
-                ValueError,
-            ):
+    company = load_page(f"{origin}/company/{quote(base_symbol, safe='')}/consolidated/")
+    classifications = [
+        link for link in company.select('#peers a[href^="/market/"]')
+        if re.fullmatch(r"/market/(?:IN\d+/)+", link["href"])
+    ]
+    if not classifications:
+        raise StockDataError("Industry classification unavailable from Screener; no Nifty 50 fallback used.")
+    classification = max(classifications, key=lambda link: link["href"].count("/"))
+    industry = classification.get_text(" ", strip=True)
+    industry_url = origin + classification["href"]
+    next_url = industry_url
+    visited = set()
+    peer_values = {}
+    excluded = 0
+    expected_pages = None
+    while next_url:
+        if next_url in visited:
+            raise StockDataError("Industry P/E pagination repeated a page; incomplete benchmark withheld.")
+        visited.add(next_url)
+        page = load_page(next_url)
+        pagination = re.search(
+            r"Showing page\s+(\d+)\s+of\s+(\d+)", page.get_text(" ", strip=True),
+            re.IGNORECASE,
+        )
+        if pagination is None:
+            raise StockDataError("Industry page count unavailable; completeness cannot be verified.")
+        page_number, page_count = map(int, pagination.groups())
+        if expected_pages is None:
+            expected_pages = page_count
+        if page_count != expected_pages or page_number != len(visited):
+            raise StockDataError("Industry pagination changed during lookup; benchmark withheld.")
+        table = page.select_one("table")
+        if table is None:
+            raise StockDataError("Industry P/E table unavailable; incomplete benchmark withheld.")
+        headers = [cell.get_text(" ", strip=True) for cell in table.select("tr")[0].select("th")]
+        if "P/E" not in headers or "Company" not in headers:
+            raise StockDataError("Industry P/E table columns changed; benchmark unavailable.")
+        pe_index = headers.index("P/E")
+        company_index = headers.index("Company")
+        for row in table.select("tr"):
+            cells = row.find_all("td", recursive=False)
+            if not cells:
                 continue
-            if value is not None:
-                peer_values.append(value)
-
+            if len(cells) <= max(pe_index, company_index):
+                raise StockDataError("Industry P/E row is incomplete; benchmark withheld.")
+            link = cells[company_index].select_one('a[href^="/company/"]')
+            if link is None:
+                raise StockDataError("Industry P/E company identifier missing; benchmark withheld.")
+            peer_symbol = link["href"].split("/")[2]
+            if peer_symbol == base_symbol:
+                continue
+            raw_value = cells[pe_index].get_text(strip=True).replace(",", "")
+            try:
+                value = float(raw_value)
+            except ValueError:
+                if raw_value not in ("", "-", "—", "N/A"):
+                    raise StockDataError(f"Unrecognized industry P/E value: {raw_value}")
+                excluded += 1
+                continue
+            if math.isfinite(value) and value > 0:
+                peer_values[peer_symbol] = value
+            else:
+                excluded += 1
+        next_link = page.find("a", string=re.compile(r"^\s*Next\s*$"))
+        if next_link is None:
+            next_link = next(
+                (link for link in page.select("a[href]") if link.get_text(" ", strip=True) == "Next"),
+                None,
+            )
+        next_url = urljoin(industry_url, next_link["href"]) if next_link else ""
+        if next_url and not next_url.startswith(industry_url + "?"):
+            raise StockDataError("Unexpected industry pagination URL; benchmark withheld.")
+    if len(visited) != expected_pages:
+        raise StockDataError("Industry pagination ended early; incomplete benchmark withheld.")
     if not peer_values:
-        return None, f"No usable P/E data was available for {industry} peers."
-
-    median_pe = float(pd.Series(peer_values).median())
-    return median_pe, (
-        f"Median of {len(peer_values)} available {industry} peers in the "
-        f"{source} universe; analyzed stock excluded."
+        return None, f"No positive P/E data available for other {industry} companies. Source: {industry_url}"
+    return float(pd.Series(peer_values).median()), (
+        f"Median of {len(peer_values)} available {industry} peers across all "
+        f"{len(visited)} Screener industry page(s), not limited to Nifty 50; "
+        f"analyzed stock excluded, {excluded} missing/non-positive P/Es excluded. "
+        "Source-reported TTM P/Es may differ in timing, consolidation and share basis "
+        f"from Yahoo earnings; not a market-cap-weighted ratio. Source: {industry_url}"
     )
 
 
@@ -735,7 +999,7 @@ def _download_technical_universe(
             prices = yf.download(
                 batch,
                 period="1y",
-                auto_adjust=True,
+                auto_adjust=False,
                 progress=False,
                 threads=True,
                 timeout=20,
@@ -811,11 +1075,17 @@ def _quality_fundamentals(
 
     sales = _statement_values(statement, "Total Revenue")
     profits = _statement_values(statement, "Net Income")
-    if len(sales) < 2 or len(profits) < 2:
+    if (
+        len(sales) < 2 or len(profits) < 2
+        or any(value is None for value in sales[:2] + profits[:2])
+    ):
         return None, f"{symbol}: fewer than two quarterly statements"
+    periods = statement.sort_index(axis=1, ascending=False).columns
+    if not 70 <= (periods[0] - periods[1]).days <= 110:
+        return None, f"{symbol}: latest reported periods are not consecutive quarters"
 
     sales_growth = (sales[0] / sales[1] - 1) * 100 if sales[1] else None
-    profit_growth = (profits[0] / profits[1] - 1) * 100 if profits[1] else None
+    profit_growth = (profits[0] - profits[1]) / abs(profits[1]) * 100 if profits[1] else None
     technical_score = float(technical_row["Technical Score"])
     above_200_dma = bool(technical_row["Above 200 DMA"])
     latest_profit = profits[0]
@@ -920,7 +1190,7 @@ def value_portfolio(holdings: list[dict[str, object]]) -> pd.DataFrame:
     for holding in holdings:
         symbol = normalize_symbol(str(holding["symbol"]))
         try:
-            history = get_price_history(symbol, period="5d")
+            history = get_price_history(symbol, period="5d", auto_adjust=False)
         except StockDataError:
             continue
         price = float(history["Close"].iloc[-1])
@@ -937,7 +1207,7 @@ def value_portfolio(holdings: list[dict[str, object]]) -> pd.DataFrame:
                 "Invested": invested,
                 "Current Value": current_value,
                 "P/L": current_value - invested,
-                "P/L %": ((current_value / invested) - 1) * 100 if invested else 0,
+                "P/L %": ((current_value / invested) - 1) * 100 if invested else None,
             }
         )
     result = pd.DataFrame(rows)
@@ -949,20 +1219,68 @@ def value_portfolio(holdings: list[dict[str, object]]) -> pd.DataFrame:
     return result
 
 
-def build_watchlist_report(symbols: list[str]) -> pd.DataFrame:
+def watchlist_price_performance(
+    history: pd.DataFrame, *, as_of: date | None = None,
+) -> dict[str, float | None]:
+    if history.empty or not isinstance(history.index, pd.DatetimeIndex):
+        raise StockDataError("Dated price history is required to calculate price performance.")
+    history = history.sort_index()
+    as_of = as_of or datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    price = float(history["Close"].iloc[-1])
+    highs = history["High"] if "High" in history else history["Close"]
+    result = {
+        "1M Return %": _calendar_return(history["Close"], 1),
+        "6M Return %": _calendar_return(history["Close"], 6, as_of=as_of),
+        "1Y Return %": _calendar_return(history["Close"], 12, as_of=as_of),
+    }
+    valid = highs.loc[highs.notna() & (highs > 0) & (highs < float("inf"))]
+    high = float(valid.max()) if not valid.empty else None
+    result["From All-Time High %"] = (
+        (price / high - 1) * 100
+        if high is not None and math.isfinite(price) and price > 0
+        else None
+    )
+    return result
+
+
+def build_watchlist_report(
+    symbols: list[str], *, as_of: date | None = None,
+) -> pd.DataFrame:
+    as_of = as_of or datetime.now(ZoneInfo("Asia/Kolkata")).date()
     rows = []
     for symbol in symbols:
         normalized = normalize_symbol(symbol)
         try:
-            snapshot = technical_snapshot(get_price_history(normalized))
+            history = get_price_history(normalized, period="max")
+            snapshot = technical_snapshot(history)
+            history = history.sort_index()
+            performance = watchlist_price_performance(history, as_of=as_of)
+            target = pd.Timestamp(as_of) - pd.DateOffset(years=1)
+            reference = history.loc[
+                history.index.normalize().date <= target.date()
+            ]
+            six_month_target = pd.Timestamp(as_of) - pd.DateOffset(months=6)
+            six_month_reference = history.loc[
+                history.index.normalize().date <= six_month_target.date()
+            ]
         except StockDataError:
             continue
         rows.append(
             {
                 "Symbol": normalized,
                 "Price": snapshot["Price"],
+                "Price Date": history.index[-1].date().isoformat(),
+                "6M Reference Date": (
+                    six_month_reference.index[-1].date().isoformat()
+                    if not six_month_reference.empty else None
+                ),
+                "1Y Reference Date": (
+                    reference.index[-1].date().isoformat() if not reference.empty else None
+                ),
+                "20D Support": snapshot["20D Support"],
+                "60D Support": snapshot["60D Support"],
+                **performance,
                 "RSI": snapshot["RSI"],
-                "6M Return %": snapshot["6M Return %"],
                 "Above 200 DMA": snapshot["Above 200 DMA"],
                 "Technical Score": snapshot["Technical Score"],
             }

@@ -71,6 +71,7 @@ class AIServiceError(RuntimeError):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_stock_data(symbol: str):
+    """Cache currency-verified TTM P/E and period-aligned financial ratios."""
     return get_stock_data(symbol)
 
 
@@ -81,16 +82,19 @@ def cached_news(symbol: str):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_history(symbol: str):
+    """Cache unadjusted closes for price-only returns and chart levels."""
     return get_price_history(symbol)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_peers(symbol: str):
+    """Cache peers using unadjusted price-only calendar returns."""
     return get_peer_comparison(symbol)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_industry_pe(symbol: str):
+    """Cache full-industry Screener TTM peer medians, not Nifty 50 subsets."""
     return get_industry_pe(symbol)
 
 
@@ -101,12 +105,14 @@ def cached_open_ipos(today):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_top_stocks():
+    """Cache rankings using unadjusted price-only calendar momentum."""
     return rank_top_stocks()
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def cached_watchlist_report(symbols: tuple[str, ...]):
-    return build_watchlist_report(list(symbols))
+def cached_watchlist_report(symbols: tuple[str, ...], as_of):
+    """Cache today-anchored 6M/1Y returns with actual reference dates."""
+    return build_watchlist_report(list(symbols), as_of=as_of)
 
 
 def run_quality_screen_refresh():
@@ -175,8 +181,16 @@ def analyze_with_ai(
     ai_facts = {
         "price_inr": rounded(data["Price"]),
         "market_cap_crore": rounded(market_cap_crore),
-        "pe": rounded(data["PE"]),
-        "roe_percent": (
+        "pe_ttm": rounded(data["PE"]),
+        "ttm_quarter_ended": data.get("TTM Period"),
+        "pe_basis": data.get("PE Note"),
+        "financial_period": data.get("Financial Period"),
+        "financial_currency": data.get("Financial Currency"),
+        "revenue_growth_currency": data.get("Revenue Currency"),
+        "financial_data_note": data.get("Data Note"),
+        "free_cash_flow": rounded(data.get("FreeCashFlow")),
+        "free_cash_flow_currency": data.get("Free Cash Flow Currency"),
+        "roe_year_end_equity_percent": (
             rounded(data["ROE"] * 100) if data["ROE"] is not None else None
         ),
         "debt_equity_percent": rounded(data["DebtEquity"]),
@@ -257,6 +271,16 @@ def format_decimal(value):
 
 def format_crore(value):
     return "N/A" if value is None else f"₹{value:,.2f} Cr"
+
+
+def format_cash_flow(data):
+    value = data.get("FreeCashFlow")
+    currency = data.get("Free Cash Flow Currency")
+    if value is None or not currency:
+        return "N/A"
+    if currency == "INR":
+        return format_crore(to_crore(value))
+    return f"{currency} {value / 1_000_000:,.2f} million"
 
 
 def ensure_support_resistance(chart_data):
@@ -430,16 +454,36 @@ def render_analysis_tab():
     st.markdown(f"### {symbol}")
     st.metric("Price", f"₹{data['Price']:,.2f}")
     stock_pe_column, industry_pe_column = st.columns(2)
-    stock_pe_column.metric("Stock P/E", format_decimal(data["PE"]))
+    stock_pe_column.metric(
+        "Stock P/E (TTM)", format_decimal(data["PE"]), help=data.get("PE Note"),
+    )
     industry_pe_column.metric(
-        "Industry P/E",
+        "Industry P/E (TTM peer median)",
         format_decimal(analysis["industry_pe"]),
         help=analysis["industry_pe_note"],
     )
     st.caption(
-        "Industry P/E is an available Nifty 50 industry-peer median, not a "
-        f"full-market industry average. {analysis['industry_pe_note']}"
+        analysis["industry_pe_note"]
     )
+    st.caption(
+        f"Annual financial period: {data.get('Financial Period') or 'Unavailable'}. "
+        f"Latest price date: {data.get('Price Date') or 'Unavailable'}. "
+        f"Statement currency: {data.get('Financial Currency') or 'Unverified'}. "
+        f"Stock P/E: {data.get('PE Note', 'Unavailable')}. "
+        "TTM uses four consecutive quarters or FY + current YTD - prior YTD; "
+        "annual profit alone is valid only when the FY end equals the TTM end. "
+        "ROE uses annual shareholder profit / year-end equity (not average equity); "
+        "debt/equity is shown as a percentage: 50% = 0.5x. "
+        "Revenue growth is annual YoY in the reported currency, not necessarily INR. "
+        "Profit margin uses Yahoo Total Revenue (for banks, this may be net revenue); "
+        "debt includes Yahoo Total Debt, which can differ from website borrowings. "
+        "Prices are latest available daily closes, "
+        "not guaranteed real-time quotes."
+    )
+    if data["PE"] is None:
+        st.warning(data.get("PE Note") or "TTM P/E unavailable.")
+    if data.get("Data Note"):
+        st.warning(data["Data Note"])
     metric_columns = st.columns(4)
     metric_columns[0].metric("Fundamental Score", f"{score}/100")
     metric_columns[1].metric("ROE", format_percent(data["ROE"]))
@@ -455,6 +499,13 @@ def render_analysis_tab():
     confidence_column.metric(
         "Confidence",
         f"{recommendation['confidence']:.2f}/10",
+    )
+    st.caption(
+        "Scores and confidence are rule-based heuristics, not calibrated "
+        "probabilities of returns. Charts and technicals use unadjusted daily "
+        "prices and Wilder RSI(14). Returns exclude dividends: latest close / "
+        "close on or before the calendar lookback date - 1. They are not live "
+        "intraday returns; Yahoo may still normalize historical prices for splits."
     )
     st.markdown("**Problems**")
     if recommendation["problems"]:
@@ -495,27 +546,28 @@ def render_analysis_tab():
                     "Metric": "Market Cap",
                     "Value": format_crore(market_cap_crore),
                 },
-                {"Metric": "PE", "Value": format_decimal(data["PE"])},
+                {"Metric": "P/E (TTM)", "Value": format_decimal(data["PE"])},
+                {"Metric": "P/E (latest annual, comparison only)", "Value": format_decimal(data.get("Annual PE"))},
                 {
-                    "Metric": "Industry P/E (Nifty 50 peer median)",
+                    "Metric": "Industry P/E (TTM peer median)",
                     "Value": format_decimal(analysis["industry_pe"]),
                 },
-                {"Metric": "ROE", "Value": format_percent(data["ROE"])},
+                {"Metric": "ROE (annual / year-end equity)", "Value": format_percent(data["ROE"])},
                 {
-                    "Metric": "Debt / Equity",
+                    "Metric": "Debt / Equity (%)",
                     "Value": format_decimal(data["DebtEquity"]),
                 },
                 {
-                    "Metric": "Revenue Growth",
+                    "Metric": f"Revenue Growth (annual YoY, {data.get('Revenue Currency') or 'currency unverified'})",
                     "Value": format_percent(data["RevenueGrowth"]),
                 },
                 {
-                    "Metric": "Profit Margin",
+                    "Metric": "Profit Margin (annual)",
                     "Value": format_percent(data["ProfitMargin"]),
                 },
                 {
-                    "Metric": "Free Cash Flow",
-                    "Value": format_crore(to_crore(data["FreeCashFlow"])),
+                    "Metric": "Free Cash Flow (annual)",
+                    "Value": format_cash_flow(data),
                 },
             ]
         )
@@ -525,6 +577,13 @@ def render_analysis_tab():
     with technical_tab:
         history = analysis["history"]
         chart_data = ensure_support_resistance(calculate_technicals(history))
+        st.caption(
+            "Daily MACD(12,26,9): EMA(12) - EMA(26); signal = EMA(9) of MACD. "
+            "EMAs use alpha = 2/(period + 1), seeded from the first available "
+            "close (signal from the first MACD). Values are price units, not "
+            "percentages. Different history lengths, EMA seeds, intraday prices "
+            "or adjusted prices can differ from other platforms."
+        )
         st.caption(
             "Support and resistance use the lowest and highest closes from "
             "the previous 20 and 60 trading sessions."
@@ -695,6 +754,10 @@ def render_portfolio_tab():
         return
 
     total_invested = valuation["Invested"].sum()
+    st.caption(
+        "Valuation uses unadjusted latest daily closes; P/L excludes fees, taxes "
+        "and dividends. Percentage P/L is undefined (N/A) when invested cost is zero."
+    )
     total_value = valuation["Current Value"].sum()
     metrics = st.columns(3)
     metrics[0].metric("Invested", f"₹{total_invested:,.2f}")
@@ -717,7 +780,8 @@ def render_portfolio_tab():
                 "P/L": "₹{:,.2f}",
                 "P/L %": "{:.2f}%",
                 "Allocation %": "{:.2f}%",
-            }
+            },
+            na_rep="N/A",
         ),
         hide_index=True,
         use_container_width=True,
@@ -748,15 +812,37 @@ def render_watchlist_tab(credentials):
 
     try:
         with st.spinner("Building report from live online prices..."):
-            report = cached_watchlist_report(tuple(symbols))
+            report = cached_watchlist_report(
+                tuple(symbols), datetime.now(INDIA_TIME).date(),
+            )
     except StockDataError as exc:
         st.error(str(exc))
         return
 
+    st.caption(
+        "20D and 60D support are the lowest closing prices over the previous "
+        "20 and 60 trading sessions, excluding the current session. "
+        "1M, 6M and 1Y returns use (latest close / earlier close - 1) "
+        "× 100. 1M looks back from the latest price date; 6M and 1Y look back from "
+        "today's India date. The session on or before each target date is used. "
+        "Price Date, 6M Reference Date and 1Y Reference Date show the actual sessions; when Price "
+        "Date is older than today, 6M/1Y mix the latest available quote with "
+        "today's anniversary reference. "
+        "Positive means a gain; negative means a loss. All-time-high distance "
+        "uses (current close / high - 1) × 100 over all available unadjusted Yahoo "
+        "history, including the latest session; closing highs are used if daily "
+        "High data is absent. Dividend adjustments are not included. "
+        "N/A means there is not enough price history."
+    )
     st.dataframe(
         report.style.format(
             {
                 "Price": "₹{:,.2f}",
+                "20D Support": "₹{:,.2f}",
+                "60D Support": "₹{:,.2f}",
+                "1M Return %": "{:+.2f}%",
+                "1Y Return %": "{:+.2f}%",
+                "From All-Time High %": "{:+.2f}%",
                 "RSI": "{:.2f}",
                 "6M Return %": "{:.2f}%",
             },
@@ -846,6 +932,12 @@ def render_quality_screen_tab():
         "the 200 DMA, positive latest quarterly sales growth, positive latest "
         "quarterly profit growth, and positive latest-quarter profit. A match "
         "is a research candidate, not a guaranteed buy recommendation."
+    )
+    st.caption(
+        "Quarterly growth compares consecutive reported quarters, not YoY. "
+        "Profit growth uses (latest PAT - prior PAT) / abs(prior PAT); "
+        "a zero prior PAT cannot produce a percentage. Cached results must "
+        "be refreshed to reflect calculation changes."
     )
     if "quality_companies" not in st.session_state:
         load_quality_result_into_session()
