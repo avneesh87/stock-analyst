@@ -250,6 +250,9 @@ def analyze_with_ai(
             f"{model}:streamGenerateContent?alt=sse"
         )
         generated_chunks = 0
+        finish_reasons = set()
+        block_reasons = set()
+        content_type = "unknown"
         try:
             for attempt in range(3):
                 with requests.post(
@@ -271,26 +274,47 @@ def analyze_with_ai(
                         continue
 
                     response.raise_for_status()
+                    content_type = response.headers.get("Content-Type", "unknown")
                     for line in response.iter_lines(decode_unicode=True):
                         if not line:
                             continue
                         if isinstance(line, bytes):
                             line = line.decode("utf-8")
-                        if not line.startswith("data:"):
+                        line = line.strip()
+                        if line.startswith("data:"):
+                            payload = line[5:].strip()
+                        elif line.startswith(("{", "[")):
+                            payload = line
+                        else:
                             continue
-                        payload = line[5:].strip()
                         if payload == "[DONE]":
                             break
                         result = json.loads(payload)
-                        for candidate in result.get("candidates", []):
-                            for part in candidate.get("content", {}).get("parts", []):
-                                text = part.get("text")
-                                if text and not part.get("thought"):
-                                    generated_chunks += 1
-                                    yield text
+                        results = result if isinstance(result, list) else [result]
+                        for item in results:
+                            feedback = item.get("promptFeedback", {})
+                            if feedback.get("blockReason"):
+                                block_reasons.add(feedback["blockReason"])
+                            for candidate in item.get("candidates", []):
+                                if candidate.get("finishReason"):
+                                    finish_reasons.add(candidate["finishReason"])
+                                for part in candidate.get("content", {}).get("parts", []):
+                                    text = part.get("text")
+                                    if text and not part.get("thought"):
+                                        generated_chunks += 1
+                                        yield text
                     break
             if not generated_chunks:
-                raise AIServiceError("Gemini returned no text for this recommendation.")
+                reasons = []
+                if block_reasons:
+                    reasons.append(f"blocked: {', '.join(sorted(block_reasons))}")
+                if finish_reasons:
+                    reasons.append(f"finish reason: {', '.join(sorted(finish_reasons))}")
+                if not reasons:
+                    reasons.append(f"response type: {content_type}")
+                raise AIServiceError(
+                    "Gemini returned no displayable text (" + "; ".join(reasons) + ")."
+                )
         except requests.RequestException as exc:
             status_code = exc.response.status_code if exc.response is not None else None
             if status_code == 503:
