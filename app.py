@@ -13,6 +13,8 @@ from analytics import (
     StockDataError,
     build_recommendation,
     build_watchlist_report,
+    calculate_alpha_beta,
+    calculate_period_returns,
     calculate_technicals,
     get_industry_pe,
     get_news,
@@ -82,9 +84,9 @@ def cached_news(symbol: str):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def cached_history(symbol: str):
+def cached_history(symbol: str, period: str = "1y"):
     """Cache unadjusted closes for price-only returns and chart levels."""
-    return get_price_history(symbol)
+    return get_price_history(symbol, period=period)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -417,28 +419,73 @@ def render_analysis_tab():
     st.subheader("Stock research")
     st.session_state.setdefault("analysis_symbol", "TCS.NS")
     analysis_requested = st.session_state.pop("analysis_requested", False)
-    input_column, button_column = st.columns([4, 1])
-    symbol_input = input_column.text_input(
-        "NSE/Yahoo symbol",
-        key="analysis_symbol",
-        help="The .NS suffix is added automatically when omitted.",
-    )
-    analyze = button_column.button(
-        "Analyze",
-        type="primary",
-        use_container_width=True,
-    )
+    with st.form("stock-analysis-form"):
+        input_column, benchmark_column, risk_free_column, button_column = st.columns(
+            [3, 2, 2, 1]
+        )
+        symbol_input = input_column.text_input(
+            "NSE/Yahoo symbol",
+            key="analysis_symbol",
+            help="The .NS suffix is added automatically when omitted.",
+        )
+        benchmark_symbol = benchmark_column.text_input(
+            "Market benchmark",
+            value="^NSEI",
+            key="analysis_benchmark",
+            help="Yahoo Finance symbol for the benchmark, e.g. ^NSEI.",
+        ).strip().upper()
+        risk_free_rate = risk_free_column.number_input(
+            "Annual risk-free rate (%)",
+            min_value=0.0,
+            max_value=30.0,
+            value=6.5,
+            step=0.25,
+            key="analysis_risk_free_rate",
+        ) / 100
+        analyze = button_column.form_submit_button(
+            "Analyze",
+            type="primary",
+            use_container_width=True,
+        )
 
     if analyze or analysis_requested:
         symbol = normalize_symbol(symbol_input)
         if not symbol:
             st.error("Enter a stock symbol.")
             return
+        if not benchmark_symbol:
+            st.error("Enter a market benchmark symbol.")
+            return
         try:
             with st.spinner("Loading live fundamentals, news, and price history..."):
                 data = cached_stock_data(symbol)
                 news = cached_news(symbol)
                 history = cached_history(symbol)
+                try:
+                    stock_period_returns = calculate_period_returns(
+                        cached_history(symbol, period="5y")
+                    )
+                    stock_period_returns_error = None
+                except StockDataError as exc:
+                    stock_period_returns = None
+                    stock_period_returns_error = str(exc)
+                try:
+                    benchmark_history = cached_history(benchmark_symbol)
+                    risk_metrics = calculate_alpha_beta(
+                        history, benchmark_history, risk_free_rate,
+                    )
+                    risk_metrics_error = None
+                except StockDataError as exc:
+                    risk_metrics = None
+                    risk_metrics_error = str(exc)
+                try:
+                    benchmark_period_returns = calculate_period_returns(
+                        cached_history(benchmark_symbol, period="5y")
+                    )
+                    benchmark_period_returns_error = None
+                except StockDataError as exc:
+                    benchmark_period_returns = None
+                    benchmark_period_returns_error = str(exc)
                 sentiment = news_sentiment(news)
                 technicals = technical_snapshot(history)
                 try:
@@ -455,6 +502,14 @@ def render_analysis_tab():
             "news": news,
             "sentiment": sentiment,
             "history": history,
+            "benchmark_symbol": benchmark_symbol,
+            "risk_metrics": risk_metrics,
+            "risk_metrics_error": risk_metrics_error,
+            "risk_free_rate": risk_free_rate,
+            "stock_period_returns": stock_period_returns,
+            "stock_period_returns_error": stock_period_returns_error,
+            "benchmark_period_returns": benchmark_period_returns,
+            "benchmark_period_returns_error": benchmark_period_returns_error,
             "technicals": technicals,
             "industry_pe": industry_pe,
             "industry_pe_note": industry_pe_note,
@@ -566,8 +621,11 @@ def render_analysis_tab():
         add_to_watchlist(symbol)
         st.success(f"{symbol} added to the watchlist.")
 
-    fundamental_tab, technical_tab, news_tab, ai_tab = st.tabs(
-        ["Fundamentals", "Technicals", "News sentiment", "AI recommendation"]
+    fundamental_tab, technical_tab, risk_tab, news_tab, ai_tab = st.tabs(
+        [
+            "Fundamentals", "Technicals", "Risk & Return", "News sentiment",
+            "AI recommendation",
+        ]
     )
     with fundamental_tab:
         fundamentals = pd.DataFrame(
@@ -694,6 +752,93 @@ def render_analysis_tab():
             hide_index=True,
             use_container_width=True,
         )
+
+    with risk_tab:
+        st.markdown("#### Alpha and beta")
+        st.markdown("#### Trailing annualized returns")
+        stock_returns = analysis.get("stock_period_returns")
+        benchmark_returns = analysis.get("benchmark_period_returns")
+        return_rows = []
+        for period, label in (
+            ("1Y", "1 Year"),
+            ("3Y", "3 Years"),
+            ("5Y", "5 Years"),
+        ):
+            return_rows.append(
+                {
+                    "Period": label,
+                    f"{symbol} CAGR": format_percent(
+                        stock_returns.get(period) if stock_returns else None
+                    ),
+                    f"{analysis.get('benchmark_symbol', '^NSEI')} CAGR": format_percent(
+                        benchmark_returns.get(period)
+                        if benchmark_returns
+                        else None
+                    ),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(return_rows),
+            hide_index=True,
+            use_container_width=True,
+        )
+        if analysis.get("stock_period_returns_error"):
+            st.warning(
+                "Stock trailing returns unavailable: "
+                f"{analysis['stock_period_returns_error']}"
+            )
+        if analysis.get("benchmark_period_returns_error"):
+            st.warning(
+                "Benchmark trailing returns unavailable: "
+                f"{analysis['benchmark_period_returns_error']}"
+            )
+        st.caption(
+            "Trailing compound annual growth rates (CAGR), using unadjusted "
+            "closes from the latest available price to the last close on or "
+            "before each calendar-year lookback date. Returns exclude dividends; "
+            "periods without enough price history are shown as N/A."
+        )
+        risk_metrics = analysis.get("risk_metrics")
+        risk_metrics_error = analysis.get("risk_metrics_error")
+        if risk_metrics_error:
+            st.warning(
+                f"Risk metrics unavailable: {risk_metrics_error}"
+            )
+        elif "risk_metrics" not in analysis:
+            st.info("Select Analyze again to calculate alpha and beta.")
+        elif risk_metrics is None:
+            st.info(
+                "Risk metrics are unavailable because the aligned price "
+                "history is too short or the benchmark has no variation."
+            )
+        else:
+            risk_columns = st.columns(3)
+            risk_columns[0].metric(
+                f"Beta (vs {analysis.get('benchmark_symbol', '^NSEI')})",
+                format_decimal(risk_metrics["beta"]),
+            )
+            risk_columns[1].metric(
+                "Annualized alpha",
+                format_percent(risk_metrics["alpha"]),
+            )
+            risk_columns[2].metric(
+                "CAPM expected return",
+                format_percent(risk_metrics["expected_return"]),
+            )
+            st.caption(
+                f"Annualized actual return: "
+                f"{format_percent(risk_metrics['actual_return'])}; "
+                f"annualized benchmark return: "
+                f"{format_percent(risk_metrics['market_return'])}; "
+                f"risk-free rate: "
+                f"{analysis.get('risk_free_rate', 0.065):.2%}; "
+                f"{risk_metrics['observations']} aligned daily returns. "
+                "Beta is covariance(stock, market) / variance(market), "
+                "using daily close-to-close price returns. Alpha is actual "
+                "annualized return minus the CAPM expected annual return. "
+                "Price returns exclude dividends; estimates use the available "
+                "history (normally one year) and are not investment advice."
+            )
 
     with news_tab:
         st.metric("Aggregate headline sentiment", sentiment["overall"])

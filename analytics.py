@@ -634,6 +634,110 @@ def _calendar_return(
     return (current / previous - 1) * 100
 
 
+def calculate_period_returns(
+    history: pd.DataFrame,
+) -> dict[str, float | None]:
+    returns: dict[str, float | None] = {
+        "1Y": None,
+        "3Y": None,
+        "5Y": None,
+    }
+    if "Close" not in history or not isinstance(history.index, pd.DatetimeIndex):
+        return returns
+
+    dates = history.index
+    if dates.tz is not None:
+        dates = dates.tz_localize(None)
+    close = pd.Series(
+        pd.to_numeric(history["Close"], errors="coerce").to_numpy(),
+        index=dates.normalize(),
+    )
+    close = close.groupby(level=0).last().sort_index()
+    close = close.where(close.map(lambda value: math.isfinite(value) and value > 0))
+    close = close.dropna()
+    if close.empty:
+        return returns
+
+    current_date = close.index[-1]
+    current_price = float(close.iloc[-1])
+    for years in (1, 3, 5):
+        target_date = current_date - pd.DateOffset(years=years)
+        earlier = close.loc[close.index <= target_date]
+        if earlier.empty:
+            continue
+        previous_price = float(earlier.iloc[-1])
+        annualized_return = (current_price / previous_price) ** (1 / years) - 1
+        if math.isfinite(annualized_return):
+            returns[f"{years}Y"] = annualized_return
+    return returns
+
+
+def calculate_alpha_beta(
+    stock_history: pd.DataFrame,
+    market_history: pd.DataFrame,
+    risk_free_rate: float = 0.065,
+) -> dict[str, float | int | None]:
+    if not math.isfinite(risk_free_rate) or risk_free_rate <= -1:
+        raise ValueError("Risk-free rate must be a finite annual rate above -100%.")
+
+    def daily_closes(history: pd.DataFrame) -> pd.Series:
+        if "Close" not in history or not isinstance(history.index, pd.DatetimeIndex):
+            return pd.Series(dtype=float)
+        dates = history.index
+        if dates.tz is not None:
+            dates = dates.tz_localize(None)
+        close = pd.Series(
+            pd.to_numeric(history["Close"], errors="coerce").to_numpy(),
+            index=dates.normalize(),
+        )
+        close = close.groupby(level=0).last().sort_index()
+        return close.where(close > 0)
+
+    aligned_closes = pd.concat(
+        [
+            daily_closes(stock_history).rename("stock"),
+            daily_closes(market_history).rename("market"),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+    aligned = aligned_closes.pct_change(fill_method=None)
+    aligned = aligned[
+        aligned["stock"].map(math.isfinite)
+        & aligned["market"].map(math.isfinite)
+    ]
+    observations = len(aligned)
+    unavailable = {
+        "beta": None,
+        "actual_return": None,
+        "market_return": None,
+        "expected_return": None,
+        "alpha": None,
+        "observations": observations,
+    }
+    if observations < 2:
+        return unavailable
+
+    market_variance = float(aligned["market"].var())
+    if not math.isfinite(market_variance) or market_variance <= 0:
+        return unavailable
+
+    beta = float(aligned["stock"].cov(aligned["market"]) / market_variance)
+    annualization = 252 / observations
+    actual_return = float((1 + aligned["stock"]).prod() ** annualization - 1)
+    market_return = float((1 + aligned["market"]).prod() ** annualization - 1)
+    expected_return = risk_free_rate + beta * (market_return - risk_free_rate)
+    alpha = actual_return - expected_return
+    return {
+        "beta": beta,
+        "actual_return": actual_return,
+        "market_return": market_return,
+        "expected_return": expected_return,
+        "alpha": alpha,
+        "observations": observations,
+    }
+
+
 def calculate_technicals(history: pd.DataFrame) -> pd.DataFrame:
     if isinstance(history.index, pd.DatetimeIndex):
         history = history.sort_index()
