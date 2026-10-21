@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from datetime import datetime
 from functools import partial
 from threading import Thread
@@ -250,37 +251,57 @@ def analyze_with_ai(
         )
         generated_chunks = 0
         try:
-            with requests.post(
-                api_url,
-                headers={"x-goog-api-key": gemini_api_key},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"maxOutputTokens": 300},
-                },
-                stream=True,
-                timeout=300,
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines(decode_unicode=True):
-                    if not line:
+            for attempt in range(3):
+                with requests.post(
+                    api_url,
+                    headers={"x-goog-api-key": gemini_api_key},
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"maxOutputTokens": 300},
+                    },
+                    stream=True,
+                    timeout=300,
+                ) as response:
+                    if response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
+                        try:
+                            delay = min(float(response.headers.get("Retry-After", "")), 8)
+                        except (TypeError, ValueError):
+                            delay = 2 ** attempt
+                        time.sleep(max(delay, 0))
                         continue
-                    if isinstance(line, bytes):
-                        line = line.decode("utf-8")
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    result = json.loads(payload)
-                    for candidate in result.get("candidates", []):
-                        for part in candidate.get("content", {}).get("parts", []):
-                            text = part.get("text")
-                            if text and not part.get("thought"):
-                                generated_chunks += 1
-                                yield text
+
+                    response.raise_for_status()
+                    for line in response.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        if isinstance(line, bytes):
+                            line = line.decode("utf-8")
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        result = json.loads(payload)
+                        for candidate in result.get("candidates", []):
+                            for part in candidate.get("content", {}).get("parts", []):
+                                text = part.get("text")
+                                if text and not part.get("thought"):
+                                    generated_chunks += 1
+                                    yield text
+                    break
             if not generated_chunks:
                 raise AIServiceError("Gemini returned no text for this recommendation.")
         except requests.RequestException as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 503:
+                raise AIServiceError(
+                    "Gemini is temporarily unavailable (HTTP 503) after retries. "
+                    "Please try again shortly."
+                ) from exc
+            if status_code == 429:
+                raise AIServiceError(
+                    "Gemini rate limit reached (HTTP 429). Please try again later."
+                ) from exc
             raise AIServiceError(f"Gemini request failed: {exc}") from exc
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AIServiceError("Gemini returned an invalid response.") from exc
