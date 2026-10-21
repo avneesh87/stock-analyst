@@ -260,7 +260,10 @@ def analyze_with_ai(
                     headers={"x-goog-api-key": gemini_api_key},
                     json={
                         "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"maxOutputTokens": 300},
+                        "generationConfig": {
+                            "maxOutputTokens": 300,
+                            "thinkingConfig": {"thinkingLevel": "LOW"},
+                        },
                     },
                     stream=True,
                     timeout=300,
