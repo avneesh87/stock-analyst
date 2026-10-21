@@ -1,6 +1,5 @@
 import json
 import os
-import time
 from datetime import datetime
 from functools import partial
 from threading import Thread
@@ -235,104 +234,6 @@ def analyze_with_ai(
     verdict. Do not invent facts or omit the final recommendation.
     This is not financial advice.
     """
-
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not gemini_api_key:
-        try:
-            gemini_api_key = st.secrets.get("GEMINI_API_KEY", "").strip()
-        except StreamlitSecretNotFoundError:
-            pass
-
-    if gemini_api_key:
-        model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
-        api_url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:streamGenerateContent?alt=sse"
-        )
-        generated_chunks = 0
-        finish_reasons = set()
-        block_reasons = set()
-        content_type = "unknown"
-        try:
-            for attempt in range(3):
-                with requests.post(
-                    api_url,
-                    headers={"x-goog-api-key": gemini_api_key},
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {
-                            "maxOutputTokens": 300,
-                            "thinkingConfig": {"thinkingLevel": "LOW"},
-                        },
-                    },
-                    stream=True,
-                    timeout=300,
-                ) as response:
-                    if response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
-                        try:
-                            delay = min(float(response.headers.get("Retry-After", "")), 8)
-                        except (TypeError, ValueError):
-                            delay = 2 ** attempt
-                        time.sleep(max(delay, 0))
-                        continue
-
-                    response.raise_for_status()
-                    content_type = response.headers.get("Content-Type", "unknown")
-                    for line in response.iter_lines(decode_unicode=True):
-                        if not line:
-                            continue
-                        if isinstance(line, bytes):
-                            line = line.decode("utf-8")
-                        line = line.strip()
-                        if line.startswith("data:"):
-                            payload = line[5:].strip()
-                        elif line.startswith(("{", "[")):
-                            payload = line
-                        else:
-                            continue
-                        if payload == "[DONE]":
-                            break
-                        result = json.loads(payload)
-                        results = result if isinstance(result, list) else [result]
-                        for item in results:
-                            feedback = item.get("promptFeedback", {})
-                            if feedback.get("blockReason"):
-                                block_reasons.add(feedback["blockReason"])
-                            for candidate in item.get("candidates", []):
-                                if candidate.get("finishReason"):
-                                    finish_reasons.add(candidate["finishReason"])
-                                for part in candidate.get("content", {}).get("parts", []):
-                                    text = part.get("text")
-                                    if text and not part.get("thought"):
-                                        generated_chunks += 1
-                                        yield text
-                    break
-            if not generated_chunks:
-                reasons = []
-                if block_reasons:
-                    reasons.append(f"blocked: {', '.join(sorted(block_reasons))}")
-                if finish_reasons:
-                    reasons.append(f"finish reason: {', '.join(sorted(finish_reasons))}")
-                if not reasons:
-                    reasons.append(f"response type: {content_type}")
-                raise AIServiceError(
-                    "Gemini returned no displayable text (" + "; ".join(reasons) + ")."
-                )
-        except requests.RequestException as exc:
-            status_code = exc.response.status_code if exc.response is not None else None
-            if status_code == 503:
-                raise AIServiceError(
-                    "Gemini is temporarily unavailable (HTTP 503) after retries. "
-                    "Please try again shortly."
-                ) from exc
-            if status_code == 429:
-                raise AIServiceError(
-                    "Gemini rate limit reached (HTTP 429). Please try again later."
-                ) from exc
-            raise AIServiceError(f"Gemini request failed: {exc}") from exc
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AIServiceError("Gemini returned an invalid response.") from exc
-        return
 
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "").strip()
     if not ollama_base_url:
@@ -962,10 +863,7 @@ def render_analysis_tab():
         )
 
     with ai_tab:
-        st.caption(
-            "Uses Gemini 3.8 Flash when GEMINI_API_KEY is configured; "
-            "otherwise uses local Ollama llama3.2:1b."
-        )
+        st.caption("Generated with Ollama llama3.2:1b.")
         try:
             with st.spinner("Generating analysis...", show_time=True):
                 st.write_stream(
