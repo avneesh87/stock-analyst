@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime
 from functools import partial
 from threading import Thread
@@ -8,6 +9,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import truststore
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from analytics import (
     StockDataError,
@@ -233,9 +235,69 @@ def analyze_with_ai(
     This is not financial advice.
     """
 
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not gemini_api_key:
+        try:
+            gemini_api_key = st.secrets.get("GEMINI_API_KEY", "").strip()
+        except StreamlitSecretNotFoundError:
+            pass
+
+    if gemini_api_key:
+        model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+        api_url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:streamGenerateContent?alt=sse"
+        )
+        generated_chunks = 0
+        try:
+            with requests.post(
+                api_url,
+                headers={"x-goog-api-key": gemini_api_key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 300},
+                },
+                stream=True,
+                timeout=300,
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8")
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    result = json.loads(payload)
+                    for candidate in result.get("candidates", []):
+                        for part in candidate.get("content", {}).get("parts", []):
+                            text = part.get("text")
+                            if text and not part.get("thought"):
+                                generated_chunks += 1
+                                yield text
+            if not generated_chunks:
+                raise AIServiceError("Gemini returned no text for this recommendation.")
+        except requests.RequestException as exc:
+            raise AIServiceError(f"Gemini request failed: {exc}") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AIServiceError("Gemini returned an invalid response.") from exc
+        return
+
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "").strip()
+    if not ollama_base_url:
+        try:
+            ollama_base_url = st.secrets.get("OLLAMA_BASE_URL", "")
+        except StreamlitSecretNotFoundError:
+            pass
+    ollama_base_url = (
+        ollama_base_url.strip().rstrip("/") or "http://localhost:11434"
+    )
     try:
         with requests.post(
-            "http://localhost:11434/api/generate",
+            f"{ollama_base_url}/api/generate",
             json={
                 "model": "llama3.2:1b",
                 "prompt": prompt,
@@ -256,7 +318,9 @@ def analyze_with_ai(
                     yield result["response"]
     except requests.ConnectionError as exc:
         raise AIServiceError(
-            "Ollama is not running. Start Ollama and ensure llama3.2:1b is installed."
+            f"Cannot connect to Ollama at {ollama_base_url}. Set OLLAMA_BASE_URL "
+            "to an Ollama server reachable from this Streamlit deployment and "
+            "ensure llama3.2:1b is installed there."
         ) from exc
     except requests.RequestException as exc:
         raise AIServiceError(f"Ollama request failed: {exc}") from exc
@@ -850,7 +914,10 @@ def render_analysis_tab():
         )
 
     with ai_tab:
-        st.caption("Generated locally with Ollama llama3.2:1b.")
+        st.caption(
+            "Uses Gemini 3.8 Flash when GEMINI_API_KEY is configured; "
+            "otherwise uses local Ollama llama3.2:1b."
+        )
         try:
             with st.spinner("Generating analysis...", show_time=True):
                 st.write_stream(
