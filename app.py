@@ -38,6 +38,7 @@ from ipo_screening import (
     IPO_SOURCE_URL,
     screen_open_mainboard_ipos,
 )
+from institutional import rank_institutional_stocks, screen_institutional_buying
 from notifications import (
     NotificationError,
     format_report,
@@ -106,6 +107,11 @@ def cached_industry_pe(symbol: str):
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_open_ipos(today):
     return screen_open_mainboard_ipos(today, include_upcoming=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_institutional_buying():
+    return screen_institutional_buying()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -984,6 +990,9 @@ def render_portfolio_tab():
 
 
 def render_watchlist_tab(credentials):
+    if st.session_state.get("main_tab", "Stock Analysis") != "Watchlist & Alerts":
+        return
+
     st.subheader("Watchlist and on-demand alerts")
     add_column, button_column = st.columns([4, 1])
     symbol = normalize_symbol(
@@ -1381,6 +1390,63 @@ def render_ipo_screen_tab():
             )
 
 
+def render_institutional_tab():
+    st.subheader("Top 20 stocks with increasing FII/DII holdings")
+    st.caption(
+        "Latest reported quarterly shareholdings from Screener, covering Nifty 500 "
+        "where available. Changes are percentage points (pp), not daily purchases "
+        "or transaction values. Ownership changes can also reflect dilution or "
+        "reclassification and are not proof of open-market buying."
+    )
+    mode = st.radio(
+        "Institutional investors", ["FII", "DII", "FII+DII"],
+        index=2, horizontal=True, key="institutional_mode",
+    )
+    if st.button("Refresh FII/DII data", type="primary"):
+        cached_institutional_buying.clear()
+        st.session_state["institutional_requested"] = True
+    if not st.session_state.get("institutional_requested"):
+        st.info("Select Refresh FII/DII data to load recent disclosures. A full scan can take several minutes.")
+        return
+    try:
+        with st.spinner("Checking recent institutional shareholding disclosures..."):
+            report = cached_institutional_buying()
+    except StockDataError as exc:
+        st.error(str(exc))
+        return
+    st.caption(
+        f"Coverage: {report.universe}. Valid reports: {len(report.stocks)}/{report.total}. "
+        f"Checked {report.checked_at.strftime('%d %b %Y %H:%M IST')}. Cached up to 1 hour."
+    )
+    for warning in report.warnings:
+        st.warning(warning)
+    ranked = rank_institutional_stocks(report.stocks, mode)
+    if ranked.empty:
+        st.info("No qualifying stocks are available for this filter in the latest reporting quarter.")
+        return
+    st.caption(
+        "Ranked by combined holding increase, or the selected investor's change. "
+        "FII+DII requires increases from each group. All ranked stocks use the same latest quarter. "
+        "Fewer than 20 rows means fewer qualifying stocks were available."
+    )
+    for column in ("Previous quarter", "Latest quarter"):
+        ranked[column] = ranked[column].map(lambda value: value.strftime("%b %Y"))
+    st.dataframe(
+        ranked, hide_index=True, width="stretch",
+        column_config={
+            "Source": st.column_config.LinkColumn("Source", display_text="Shareholding"),
+            **{
+                column: st.column_config.NumberColumn(column, format="%.2f")
+                for column in ranked.columns if column.endswith(("(%)", "(pp)"))
+            },
+        },
+    )
+    st.download_button(
+        "Download FII/DII results", ranked.to_csv(index=False),
+        file_name="fii_dii_top20.csv", mime="text/csv",
+    )
+
+
 st.title("📈 AI Indian Stock Analyst")
 st.caption(
     "Live online research, sentiment, technicals, peers, portfolio, "
@@ -1396,6 +1462,7 @@ notification_credentials = render_notification_sidebar()
     top_picks_tab,
     quality_screen_tab,
     ipo_screen_tab,
+    institutional_tab,
 ) = st.tabs(
     [
         "Stock Analysis",
@@ -1405,6 +1472,7 @@ notification_credentials = render_notification_sidebar()
         "Top 10 Picks",
         "Quality Screen",
         "IPO Screening",
+        "FII/DII buying stock",
     ],
     key="main_tab",
     on_change="rerun",
@@ -1424,3 +1492,5 @@ with quality_screen_tab:
     render_quality_screen_tab()
 with ipo_screen_tab:
     render_ipo_screen_tab()
+with institutional_tab:
+    render_institutional_tab()
