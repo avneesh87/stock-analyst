@@ -1303,7 +1303,7 @@ def render_ipo_screen_tab():
 
     for issue in report.issues:
         with st.expander(
-            f"{issue.name} | {issue.status} | {issue.assessment.verdict}", expanded=True,
+            f"{issue.name} | {issue.status} | {issue.assessment.verdict}", expanded=False,
         ):
             st.write(f"Status: {issue.status}")
             if issue.opens is not None and issue.closes is not None:
