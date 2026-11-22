@@ -43,7 +43,13 @@ from ipo_screening import (
     screen_open_mainboard_ipos,
 )
 from institutional import rank_institutional_stocks, screen_institutional_buying
-from metal_history import parse_city_history, parse_ibja_history
+from metal_history import (
+    calculate_metal_changes,
+    parse_city_history,
+    parse_city_quote_date,
+    parse_ibja_history,
+    parse_ibja_silver_quote_date,
+)
 from metal_news import fetch_metal_news
 from etf_details import fetch_groww_etf_details
 from notifications import (
@@ -1492,6 +1498,8 @@ def fetch_indian_bullion_spot():
         "gold_24k_per_10g": gold_rates["999"] * 10,
         "gold_22k_per_10g": gold_rates.get("916", gold_rates["999"] * 916 / 999) * 10,
         "silver_per_10g": silver_per_gram * 10,
+        "gold_quote_date": None,
+        "silver_quote_date": parse_ibja_silver_quote_date(soup),
         "history": parse_ibja_history(soup, datetime.now(INDIA_TIME).date()),
     }
 
@@ -1550,6 +1558,8 @@ def fetch_indian_city_market(city):
         "gold_24k_per_10g": gold_24k,
         "gold_22k_per_10g": gold_22k,
         "silver_per_10g": float(silver_match.group(1).replace(",", "")) * 10,
+        "gold_quote_date": parse_city_quote_date(gold_soup),
+        "silver_quote_date": parse_city_quote_date(silver_soup),
         "history": parse_city_history(gold_soup, silver_soup, datetime.now(INDIA_TIME).date()),
     }
 
@@ -1697,12 +1707,9 @@ def fetch_metal_prices():
                 live_price = None
 
             price = live_price if live_price is not None else float(closes.iloc[-1])
-            previous = float(closes.iloc[-2]) if len(closes) > 1 else price
-            change_pct = ((price - previous) / previous * 100) if previous else 0.0
             latest_close = closes.index[-1]
             result[name] = {
                 "price": price,
-                "change_pct": change_pct,
                 "history": closes.tail(15),
                 "latest_session": latest_close,
                 "is_live_quote": live_price is not None,
@@ -1770,6 +1777,27 @@ def render_metal_news(currency):
         )
 
 
+def render_metal_changes(column, history):
+    latest, daily, weekly = calculate_metal_changes(history)
+
+    def display_change(label, change):
+        if change is None:
+            return f"{label}: N/A"
+        value, reference_date = change
+        text = f"{value:+.2f}%"
+        if value > 0:
+            text = f":green[{text}]"
+        elif value < 0:
+            text = f":red[{text}]"
+        return f"{label}: {text} (vs {reference_date:%d %b %Y})"
+
+    column.markdown(
+        f"{display_change('Daily', daily)}  \n{display_change('Weekly', weekly)}"
+    )
+    if latest is not None:
+        column.caption(f"History as of {latest:%d %b %Y}")
+
+
 def render_metal_prices_tab():
     st.subheader("Gold & Silver Price")
     st.caption(
@@ -1811,17 +1839,21 @@ def render_metal_prices_tab():
         gold_col.metric(
             "Gold",
             f"${gold['price']:,.2f}/oz",
-            f"{gold['change_pct']:+.2f}%",
         )
         silver_col.metric(
             "Silver",
             f"${silver['price']:,.2f}/oz",
-            f"{silver['change_pct']:+.2f}%",
         )
         forex_col.metric(
             "USD / INR",
             f"₹{prices['USD/INR']['price']:,.2f}",
-            f"{prices['USD/INR']['change_pct']:+.2f}%",
+        )
+        for column, name in zip((gold_col, silver_col, forex_col), ("Gold", "Silver", "USD/INR")):
+            render_metal_changes(column, prices[name]["history"])
+        st.caption(
+            "Changes use published daily closes, not live quotes. Daily compares with the "
+            "previous available close; weekly compares with the latest close on or before "
+            "7 calendar days earlier."
         )
 
         gold_chart = go.Figure()
@@ -1876,10 +1908,41 @@ def render_metal_prices_tab():
             )
             st.warning(f"{market} prices are unavailable: {source_error}.")
         else:
+            def quote_date(name):
+                day = indian.get(name)
+                return day.strftime("%d %b %Y") if day is not None else "Unavailable"
+
+            st.caption(
+                f"Source quote dates: Gold {quote_date('gold_quote_date')}, "
+                f"Silver {quote_date('silver_quote_date')}. "
+                "Unavailable means the quote date could not be verified from the source."
+            )
+            if market == "IBJA Benchmark":
+                st.caption(
+                    "IBJA's gold headline quote is undated; the silver quote is from its "
+                    "dated AM table. Historical dates below do not verify the gold quote date."
+                )
+            st.caption(
+                "Latest available Yahoo USD/INR history session: "
+                f"{prices['USD/INR']['latest_session']:%d %b %Y}. "
+                "Indian rates are sourced independently and are not converted using this rate."
+            )
             gold_24k_col, gold_22k_col, silver_col = st.columns(3)
             gold_24k_col.metric("Gold - 24K", f"₹{indian['gold_24k_per_10g']:,.2f}/10g")
             gold_22k_col.metric("Gold - 22K", f"₹{indian['gold_22k_per_10g']:,.2f}/10g")
             silver_col.metric("Silver - 999", f"₹{indian['silver_per_10g']:,.2f}/10g")
+            history = indian["history"]
+            for column, name in zip(
+                (gold_24k_col, gold_22k_col, silver_col),
+                ("24K Gold", "22K Gold", "Silver"),
+            ):
+                render_metal_changes(column, history.set_index("Date")[name])
+            st.caption(
+                "Changes use the latest published historical rates, which may differ from "
+                "the current rates above. Daily compares with the previous available rate; "
+                "weekly compares with the latest rate on or before 7 calendar days earlier. "
+                "IBJA history uses PM rates."
+            )
             if market == "IBJA Benchmark":
                 st.caption(
                     "IBJA Indian bullion benchmark rates. Gold: 24K (999), 22K (916). "
@@ -1887,11 +1950,10 @@ def render_metal_prices_tab():
                 )
             else:
                 st.caption(
-                    f"Indicative {market} city-market retail rates for today. "
+                    f"Indicative {market} city-market retail rates. "
                     "Rates exclude GST, TCS, making charges and dealer levies."
                 )
 
-            history = indian["history"]
             if history.empty or history.drop(columns="Date").dropna(how="all").empty:
                 st.warning(f"No published {market} history is available for the last 15 calendar days.")
             else:

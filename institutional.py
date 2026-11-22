@@ -17,6 +17,19 @@ NIFTY500_URLS = (
     "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
     "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
 )
+NIFTY500_MIRROR_URL = (
+    "https://raw.githubusercontent.com/pkjmesra/PKScreener/main/"
+    "results/Indices/ind_nifty500list.csv"
+)
+NIFTY500_MIRROR_HISTORY_URL = (
+    "https://api.github.com/repos/pkjmesra/PKScreener/commits"
+    "?path=results%2FIndices%2Find_nifty500list.csv&per_page=1"
+)
+NIFTY500_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "text/csv,*/*",
+    "Referer": "https://www.nseindia.com/",
+}
 
 
 @dataclass
@@ -89,11 +102,11 @@ def rank_institutional_stocks(stocks: pd.DataFrame, mode: str = "FII+DII") -> pd
     return ranked.reset_index(drop=True)
 
 
-def _company_holdings(company: dict, today: date) -> dict | None:
+def _company_holdings(company: dict, today: date, session: requests.Session) -> dict | None:
     symbol = str(company["Symbol"]).strip()
     url = f"https://www.screener.in/company/{quote(symbol, safe='')}/"
     try:
-        response = requests.get(url, timeout=12)
+        response = session.get(url, timeout=12)
         response.raise_for_status()
         holdings = parse_shareholding(response.text, today)
     except (requests.RequestException, StockDataError):
@@ -104,30 +117,72 @@ def _company_holdings(company: dict, today: date) -> dict | None:
     }
 
 
+def _scan_holdings_batch(companies: list[dict], today: date) -> list[dict | None]:
+    with requests.Session() as session:
+        return [_company_holdings(company, today, session) for company in companies]
+
+
+def _nifty500_candidate(url: str) -> pd.DataFrame:
+    response = requests.get(url, headers=NIFTY500_HEADERS, timeout=12)
+    response.raise_for_status()
+    candidate = pd.read_csv(StringIO(response.text), dtype=str)
+    candidate = candidate[["Symbol", "Company Name"]].dropna().copy()
+    for column in ("Symbol", "Company Name"):
+        candidate[column] = candidate[column].str.strip()
+    candidate["Symbol"] = candidate["Symbol"].str.upper()
+    candidate = candidate[
+        (candidate["Symbol"] != "") & (candidate["Company Name"] != "")
+    ].drop_duplicates("Symbol")
+    if not 400 <= len(candidate) <= 550:
+        raise StockDataError(f"Nifty 500 list has an unexpected number of constituents: {len(candidate)}.")
+    return candidate
+
+
+def _mirror_last_updated() -> str:
+    try:
+        response = requests.get(NIFTY500_MIRROR_HISTORY_URL, timeout=12)
+        response.raise_for_status()
+        commits = response.json()
+        timestamp = commits[0]["commit"]["committer"]["date"]
+        if not isinstance(timestamp, str):
+            raise ValueError("Invalid mirror update timestamp")
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%d %b %Y")
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
+        return "unavailable"
+
+
 def screen_institutional_buying() -> InstitutionalReport:
     warnings = []
     universe = None
+    source = "Nifty 500 (official constituent list)"
     for url in NIFTY500_URLS:
         try:
-            response = requests.get(url, timeout=12)
-            response.raise_for_status()
-            candidate = pd.read_csv(StringIO(response.text))
-            candidate = candidate[["Symbol", "Company Name"]].dropna().drop_duplicates("Symbol")
-            if len(candidate) < 400:
-                continue
-            universe = candidate
+            universe = _nifty500_candidate(url)
             break
-        except (requests.RequestException, ValueError, KeyError):
+        except (requests.RequestException, ValueError, KeyError, StockDataError):
             continue
-    source = "Nifty 500 (official constituent list)"
+    if universe is None:
+        try:
+            universe = _nifty500_candidate(NIFTY500_MIRROR_URL)
+        except (requests.RequestException, ValueError, KeyError, StockDataError):
+            pass
+        else:
+            source = "Nifty 500 (unofficial PKScreener GitHub mirror)"
+            warnings.append(
+                "Official Nifty 500 lists were unavailable. The unofficial mirror may be "
+                "outdated or inaccurate; its last file update is "
+                f"{_mirror_last_updated()}. Current index membership is not verified."
+            )
     if universe is None:
         universe, origin = get_nifty50_universe()
         source = f"Nifty 50 fallback ({origin})"
         warnings.append("Nifty 500 constituents were unavailable. Coverage is limited to Nifty 50, not the whole market.")
     checked_at = datetime.now(ZoneInfo("Asia/Kolkata"))
     records = universe.to_dict("records")
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        results = list(executor.map(_company_holdings, records, [checked_at.date()] * len(records)))
+    batches = [records[start:start + 20] for start in range(0, len(records), 20)]
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        batch_results = executor.map(_scan_holdings_batch, batches, [checked_at.date()] * len(batches))
+        results = [result for batch in batch_results for result in batch]
     stocks = pd.DataFrame([result for result in results if result is not None])
     missing = len(records) - len(stocks)
     if missing:

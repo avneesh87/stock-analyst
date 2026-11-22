@@ -8,6 +8,50 @@ HISTORY_COLUMNS = ["Date", "24K Gold", "22K Gold", "Silver"]
 HISTORY_DAYS = 15
 
 
+def parse_city_quote_date(soup):
+    """Read the date attached to a Goodreturns city quote."""
+    element = soup.select_one("#metal-price-date")
+    if element is None:
+        return None
+    try:
+        return datetime.strptime(element.get_text(strip=True), "%d %B %Y").date()
+    except ValueError:
+        return None
+
+
+def parse_ibja_silver_quote_date(soup):
+    """Read the date from the same IBJA table row used for the silver quote."""
+    silver = soup.select_one('td[data-label="Silver 999"]')
+    row = silver.find_parent("tr") if silver is not None else None
+    date_cell = row.find("td") if row is not None else None
+    if date_cell is None:
+        return None
+    try:
+        return datetime.strptime(date_cell.get_text(strip=True), "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def calculate_metal_changes(prices):
+    """Compare the latest published price with the previous and week-ago observations."""
+    prices = prices.dropna()
+    prices = prices[prices > 0].sort_index()
+    if prices.empty:
+        return None, None, None
+
+    latest_date = prices.index[-1]
+    latest_price = prices.iloc[-1]
+
+    def change(reference):
+        if reference.empty:
+            return None
+        return (latest_price / reference.iloc[-1] - 1) * 100, reference.index[-1]
+
+    daily = change(prices.iloc[:-1])
+    weekly = change(prices.loc[prices.index <= latest_date - timedelta(days=7)])
+    return latest_date, daily, weekly
+
+
 def _price(text):
     match = re.match(r"^\s*₹?\s*([\d,]+(?:\.\d+)?)", text)
     if not match:
