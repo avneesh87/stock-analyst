@@ -1,6 +1,7 @@
 import json
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from functools import partial
 from threading import Thread
 
@@ -9,6 +10,8 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import truststore
+import yfinance as yf
+from bs4 import BeautifulSoup
 from streamlit.errors import StreamlitSecretNotFoundError
 
 from analytics import (
@@ -23,6 +26,7 @@ from analytics import (
     get_peer_comparison,
     get_price_history,
     get_stock_data,
+    get_stock_news,
     news_sentiment,
     normalize_symbol,
     rank_top_stocks,
@@ -39,6 +43,9 @@ from ipo_screening import (
     screen_open_mainboard_ipos,
 )
 from institutional import rank_institutional_stocks, screen_institutional_buying
+from metal_history import parse_city_history, parse_ibja_history
+from metal_news import fetch_metal_news
+from etf_details import fetch_groww_etf_details
 from notifications import (
     NotificationError,
     format_report,
@@ -87,6 +94,11 @@ def cached_news(symbol: str):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def cached_stock_news(symbol: str):
+    return get_stock_news(symbol)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def cached_history(symbol: str, period: str = "1y"):
     """Cache unadjusted closes for price-only returns and chart levels."""
     return get_price_history(symbol, period=period)
@@ -112,6 +124,21 @@ def cached_open_ipos(today):
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_institutional_buying():
     return screen_institutional_buying()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_metal_prices():
+    return fetch_metal_prices()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_etf_fund_details(symbol: str):
+    return fetch_etf_fund_details(symbol)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_metal_news(currency: str):
+    return fetch_metal_news(currency)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -434,6 +461,50 @@ def render_stock_table(table, formats, key):
     )
 
 
+def render_stock_news_sentiment(symbol, sentiment, error=None):
+    st.caption(
+        f"News matching {symbol}, from Moneycontrol, Reuters, Economic Times, Mint, "
+        "CNBC/CNBC-TV18 and Business Standard. Retrieved via Google News RSS; "
+        "last 30 days. Sentiment is a keyword-based headline summary, not investment advice."
+    )
+    if error:
+        st.warning(error)
+    elif not sentiment["headlines"]:
+        st.info("No recent company-matched headlines from the selected publishers are available.")
+    else:
+        st.metric("Aggregate headline sentiment", sentiment["overall"])
+        headline_frame = pd.DataFrame(sentiment["headlines"]).reindex(
+            columns=["title", "publisher", "published", "sentiment", "link"]
+        )
+        st.dataframe(
+            headline_frame,
+            column_config={"link": st.column_config.LinkColumn("Article", display_text="Read article")},
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
+def render_analysis_company_news(symbol):
+    st.subheader(f"Company News - {symbol}")
+    if st.button("Load company news", key=f"analysis-company-news-{symbol}"):
+        try:
+            with st.spinner(f"Loading company news for {symbol}..."):
+                news = cached_stock_news(symbol)
+        except StockDataError as exc:
+            st.session_state["analysis_company_news"] = {
+                "symbol": symbol, "sentiment": news_sentiment([]), "error": str(exc),
+            }
+        else:
+            st.session_state["analysis_company_news"] = {
+                "symbol": symbol, "sentiment": news_sentiment(news), "error": None,
+            }
+    result = st.session_state.get("analysis_company_news")
+    if result is None or result["symbol"] != symbol:
+        st.info(f"Select Load company news for {symbol}. News is cached up to 15 minutes.")
+        return
+    render_stock_news_sentiment(symbol, result["sentiment"], result["error"])
+
+
 def render_analysis_tab():
     st.subheader("Stock research")
     st.session_state.setdefault("analysis_symbol", "TCS.NS")
@@ -640,10 +711,10 @@ def render_analysis_tab():
         add_to_watchlist(symbol)
         st.success(f"{symbol} added to the watchlist.")
 
-    fundamental_tab, technical_tab, risk_tab, news_tab, ai_tab = st.tabs(
+    fundamental_tab, technical_tab, risk_tab, news_tab, company_news_tab, ai_tab = st.tabs(
         [
             "Fundamentals", "Technicals", "Risk & Return", "News sentiment",
-            "AI recommendation",
+            "Company News", "AI recommendation",
         ]
     )
     with fundamental_tab:
@@ -867,6 +938,9 @@ def render_analysis_tab():
             hide_index=True,
             use_container_width=True,
         )
+
+    with company_news_tab:
+        render_analysis_company_news(symbol)
 
     with ai_tab:
         st.caption("Generated with Ollama llama3.2:1b.")
@@ -1390,6 +1464,533 @@ def render_ipo_screen_tab():
             )
 
 
+def fetch_indian_bullion_spot():
+    """Fetch daily Indian bullion benchmark rates from IBJA."""
+    response = requests.get("https://ibjarates.com", timeout=20)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    gold_rates = {}
+    for purity in ("999", "916", "750"):
+        element = soup.find(id=f"GoldRatesCompare{purity}")
+        if element is not None:
+            value = element.get_text(strip=True).replace(",", "")
+            if value.isdigit():
+                gold_rates[purity] = float(value)
+
+    silver_element = soup.select_one('td[data-label="Silver 999"]')
+    silver_per_gram = None
+    if silver_element is not None:
+        value = silver_element.get_text(strip=True).replace(",", "")
+        if value.isdigit():
+            silver_per_gram = float(value) / 1000
+
+    if "999" not in gold_rates or silver_per_gram is None:
+        raise StockDataError("Indian spot bullion prices are currently unavailable.")
+
+    return {
+        "gold_24k_per_10g": gold_rates["999"] * 10,
+        "gold_22k_per_10g": gold_rates.get("916", gold_rates["999"] * 916 / 999) * 10,
+        "silver_per_10g": silver_per_gram * 10,
+        "history": parse_ibja_history(soup, datetime.now(INDIA_TIME).date()),
+    }
+
+
+def fetch_indian_city_market(city):
+    """Fetch indicative retail market rates for an Indian city."""
+    city_slug = city.lower()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    response = requests.get(
+        f"https://www.goodreturns.in/gold-rates/{city_slug}.html",
+        timeout=20,
+        headers=headers,
+    )
+    response.raise_for_status()
+    gold_soup = BeautifulSoup(response.text, "html.parser")
+    gold_text = gold_soup.get_text(" ", strip=True)
+    gold_match = re.search(
+        rf"gold price in {city}.*?₹([\d,]+).*?₹([\d,]+)",
+        gold_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if gold_match is None:
+        gold_match = re.search(
+            rf"gold price.*?{city}.*?₹([\d,]+).*?₹([\d,]+)",
+            gold_text,
+            re.IGNORECASE | re.DOTALL,
+        )
+
+    response = requests.get(
+        f"https://www.goodreturns.in/silver-rates/{city_slug}.html",
+        timeout=20,
+        headers=headers,
+    )
+    response.raise_for_status()
+    silver_soup = BeautifulSoup(response.text, "html.parser")
+    silver_text = silver_soup.get_text(" ", strip=True)
+    silver_match = re.search(
+        rf"(?:silver|price).+?{city}.+?₹([\d,]+)\s+per gram",
+        silver_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if gold_match is None or silver_match is None:
+        raise StockDataError(f"{city} market bullion prices are currently unavailable.")
+
+    gold_24k, gold_22k = (
+        float(value.replace(",", "")) * 10 for value in gold_match.groups()
+    )
+    return {
+        "gold_24k_per_10g": gold_24k,
+        "gold_22k_per_10g": gold_22k,
+        "silver_per_10g": float(silver_match.group(1).replace(",", "")) * 10,
+        "history": parse_city_history(gold_soup, silver_soup, datetime.now(INDIA_TIME).date()),
+    }
+
+
+METAL_ETF_SYMBOLS = {
+    "Tata Gold ETF": "TATAGOLD.NS",
+    "Gold BeES": "GOLDBEES.NS",
+    "Silver BeES": "SILVERBEES.NS",
+}
+
+
+def _numeric_info_value(info, keys):
+    for key in keys:
+        try:
+            value = float(info.get(key))
+        except (TypeError, ValueError):
+            continue
+        if pd.notna(value):
+            return value
+    return None
+
+
+def fetch_etf_fund_details(symbol):
+    """Preserve Yahoo fund details and fill missing fields from Groww."""
+    warnings = []
+    try:
+        info = yf.Ticker(symbol).info
+    except Exception as exc:
+        warnings.append(f"Yahoo Finance ETF metadata failed: {exc}")
+        info = {}
+    if not info:
+        warnings.append("Yahoo Finance returned no ETF metadata; trying Groww.")
+
+    assets = _numeric_info_value(info, ("totalAssets",))
+    currency = info.get("currency")
+    if assets is None:
+        aum = "Unavailable from Yahoo Finance"
+    elif currency == "INR":
+        aum = f"₹{assets / 10_000_000:,.2f} Cr"
+    elif currency:
+        aum = f"{assets:,.2f} {currency}"
+    else:
+        aum = f"{assets:,.2f} (currency unavailable)"
+
+    expense_ratio = _numeric_info_value(
+        info, ("annualReportExpenseRatio", "netExpenseRatio")
+    )
+    expense_ratio = (
+        f"{expense_ratio * 100:.2f}%"
+        if expense_ratio is not None
+        else "Unavailable from Yahoo Finance"
+    )
+
+    average_volume = _numeric_info_value(
+        info, ("averageDailyVolume3Month", "averageVolume", "averageDailyVolume10Day")
+    )
+    average_volume = (
+        f"{average_volume / 100_000:,.2f} Lac"
+        if average_volume is not None
+        else "Unavailable from Yahoo Finance"
+    )
+
+    tracking_error = _numeric_info_value(info, ("trackingError",))
+    tracking_error = (
+        f"{tracking_error * 100:.2f}%"
+        if tracking_error is not None
+        else "Not provided by Yahoo Finance"
+    )
+    metrics = {
+        "AUM": aum,
+        "Expense ratio": expense_ratio,
+        "Avg. volume": average_volume,
+        "Tracking error": tracking_error,
+    }
+    missing = [
+        label for label, value in metrics.items()
+        if value.startswith(("Unavailable", "Not provided"))
+    ]
+    sources = {
+        label: "Yahoo Finance" for label in metrics if label not in missing
+    }
+    if missing:
+        try:
+            fallback, url = fetch_groww_etf_details(symbol)
+        except (StockDataError, requests.RequestException) as exc:
+            warnings.append(f"Groww ETF fundamentals failed: {exc}")
+        else:
+            for label in missing:
+                if label in fallback:
+                    metrics[label] = fallback[label]
+                    sources[label] = f"Groww ({url})"
+    for label in missing:
+        if label not in sources:
+            metrics[label] = "Unavailable"
+            warnings.append(f"{label} is unavailable from the checked sources.")
+    return {
+        "metrics": metrics,
+        "sources": sources,
+        "warnings": warnings,
+        "fetched_at": datetime.now(INDIA_TIME),
+    }
+
+
+def fetch_gold_silver_etf_prices():
+    """Fetch recent daily closing prices for popular Indian gold and silver ETFs."""
+    etfs = {}
+    errors = {}
+    for name, symbol in METAL_ETF_SYMBOLS.items():
+        try:
+            history = yf.Ticker(symbol).history(period="1mo", interval="1d")
+            closes = history["Close"].dropna() if "Close" in history else pd.Series(dtype=float)
+            if closes.empty:
+                raise StockDataError(f"{name} closing prices are currently unavailable.")
+            etfs[name] = {
+                "symbol": symbol,
+                "price": float(closes.iloc[-1]),
+                "history": closes.tail(15),
+                "latest_session": closes.index[-1],
+            }
+        except Exception as exc:
+            errors[name] = str(exc) or exc.__class__.__name__
+    return etfs, errors
+
+
+def fetch_metal_prices():
+    """Fetch recent COMEX gold and silver futures plus the USD/INR rate."""
+    symbols = {"Gold": "GC=F", "Silver": "SI=F", "USD/INR": "INR=X"}
+    result = {}
+    try:
+        for name, symbol in symbols.items():
+            ticker = yf.Ticker(symbol)
+            history = ticker.history(period="1mo", interval="1d")
+            closes = history["Close"].dropna() if "Close" in history else pd.Series(dtype=float)
+            if closes.empty:
+                raise StockDataError(f"{name} price is currently unavailable.")
+
+            live_price = None
+            try:
+                fast = ticker.fast_info
+                for key in ("last_price", "regularMarketPrice"):
+                    if key in fast and fast[key] is not None:
+                        live_price = float(fast[key])
+                        break
+            except Exception:
+                live_price = None
+
+            price = live_price if live_price is not None else float(closes.iloc[-1])
+            previous = float(closes.iloc[-2]) if len(closes) > 1 else price
+            change_pct = ((price - previous) / previous * 100) if previous else 0.0
+            latest_close = closes.index[-1]
+            result[name] = {
+                "price": price,
+                "change_pct": change_pct,
+                "history": closes.tail(15),
+                "latest_session": latest_close,
+                "is_live_quote": live_price is not None,
+            }
+    except Exception as exc:
+        if isinstance(exc, StockDataError):
+            raise
+        raise StockDataError(f"Gold and silver prices could not be loaded: {exc}") from exc
+
+    usd_inr = result["USD/INR"]["price"]
+    ounce_to_10g = 10 / 31.1034768
+    result["Gold"]["inr_10g"] = result["Gold"]["price"] * usd_inr * ounce_to_10g
+    result["Silver"]["inr_10g"] = result["Silver"]["price"] * usd_inr * ounce_to_10g
+    result["USD/INR"]["inr_10g"] = None
+    try:
+        result["Indian"] = fetch_indian_bullion_spot()
+    except (StockDataError, requests.RequestException) as exc:
+        result["Indian"] = None
+        result["Indian error"] = str(exc)
+    result["City"] = {}
+    for city in ("Hyderabad", "Delhi"):
+        try:
+            result["City"][city] = fetch_indian_city_market(city)
+        except (StockDataError, requests.RequestException) as exc:
+            result["City"][city] = None
+            result[f"{city} error"] = str(exc)
+    result["ETFs"], result["ETF errors"] = fetch_gold_silver_etf_prices()
+    result["fetched_at"] = datetime.now(INDIA_TIME)
+    return result
+
+
+def render_metal_news(currency):
+    st.subheader("Recent news & potential price drivers")
+    st.caption(
+        "Gold/silver market and Fed/RBI rate-decision headlines from the last 7 days. "
+        "Topic tags identify possible drivers, "
+        "not verified causes of the displayed price change or buy/sell signals."
+    )
+    try:
+        with st.spinner(f"Loading {currency} gold and silver news..."):
+            news = cached_metal_news(currency)
+    except StockDataError as exc:
+        st.warning(str(exc))
+        return
+    st.caption(
+        "Publishers: Moneycontrol, Reuters, Economic Times, Mint, CNBC/CNBC-TV18 "
+        "and Business Standard. Headlines via Google News RSS; rate decisions prioritized, "
+        "then Moneycontrol. "
+        "News fetched: "
+        + news["fetched_at"].astimezone(INDIA_TIME).strftime("%d %b %Y, %I:%M:%S %p %Z")
+    )
+    if news["skipped"]:
+        st.caption(f"Skipped {news['skipped']} headlines with missing or invalid dates/links.")
+    if not news["items"]:
+        st.info("No recent matching gold/silver or Fed/RBI rate-decision headlines were returned.")
+        return
+    for index, item in enumerate(news["items"]):
+        st.write(item["title"])
+        published = item["published"].astimezone(INDIA_TIME).strftime("%d %b %Y, %I:%M %p %Z")
+        st.caption(f"{item['publisher']} | Published: {published}")
+        if item["drivers"]:
+            st.caption("Potential drivers: " + ", ".join(item["drivers"]))
+        st.link_button(
+            "Read article", item["link"], key=f"metal-news-{currency}-{index}"
+        )
+
+
+def render_metal_prices_tab():
+    st.subheader("Gold & Silver Price")
+    st.caption(
+        "USD prices show COMEX futures. INR prices show Indian city-market "
+        "rates or IBJA bullion benchmarks per 10 grams."
+    )
+    if st.button("Refresh gold & silver prices", type="primary"):
+        cached_metal_prices.clear()
+        cached_etf_fund_details.clear()
+        cached_metal_news.clear()
+        st.session_state["metal_prices_requested"] = True
+    if not st.session_state.get("metal_prices_requested"):
+        st.info("Select Refresh gold & silver prices to load the latest market prices.")
+        return
+    try:
+        with st.spinner("Loading gold and silver market prices..."):
+            prices = cached_metal_prices()
+    except StockDataError as exc:
+        st.error(str(exc))
+        return
+
+    gold = prices["Gold"]
+    silver = prices["Silver"]
+    fetched_at = prices["fetched_at"].strftime("%d %b %Y, %I:%M:%S %p %Z")
+    usd_tab, inr_tab, etf_tab = st.tabs(["USD Prices", "INR Prices", "Gold/Silver ETFs"])
+
+    with usd_tab:
+        st.caption(f"Price data fetched: {fetched_at}")
+        quote_dates = []
+        for name in ("Gold", "Silver", "USD/INR"):
+            session = prices[name]["latest_session"]
+            quote_dates.append(session.strftime("%d %b %Y"))
+        st.caption(
+            "Latest available market session: "
+            f"Gold {quote_dates[0]}, Silver {quote_dates[1]}, USD/INR {quote_dates[2]} "
+            "(prices use live Yahoo/Fast Quote values where available)."
+        )
+        gold_col, silver_col, forex_col = st.columns(3)
+        gold_col.metric(
+            "Gold",
+            f"${gold['price']:,.2f}/oz",
+            f"{gold['change_pct']:+.2f}%",
+        )
+        silver_col.metric(
+            "Silver",
+            f"${silver['price']:,.2f}/oz",
+            f"{silver['change_pct']:+.2f}%",
+        )
+        forex_col.metric(
+            "USD / INR",
+            f"₹{prices['USD/INR']['price']:,.2f}",
+            f"{prices['USD/INR']['change_pct']:+.2f}%",
+        )
+
+        gold_chart = go.Figure()
+        gold_chart.add_trace(go.Scatter(
+            x=gold["history"].index,
+            y=gold["history"].values,
+            mode="lines+markers",
+            name="Gold (USD/oz)",
+        ))
+        gold_chart.update_layout(
+            title="Gold - USD",
+            xaxis_title="Date",
+            yaxis_title="Gold (USD per troy ounce)",
+            height=420,
+        )
+        st.plotly_chart(gold_chart, width="stretch")
+
+        silver_chart = go.Figure()
+        silver_chart.add_trace(go.Scatter(
+            x=silver["history"].index,
+            y=silver["history"].values,
+            mode="lines+markers",
+            name="Silver (USD/oz)",
+        ))
+        silver_chart.update_layout(
+            title="Silver - USD",
+            xaxis_title="Date",
+            yaxis_title="Silver (USD per troy ounce)",
+            height=420,
+        )
+        st.plotly_chart(silver_chart, width="stretch")
+        render_metal_news("USD")
+
+    with inr_tab:
+        st.caption(f"Price data fetched: {fetched_at}")
+        market = st.radio(
+            "Indian market",
+            ["Hyderabad", "Delhi", "IBJA Benchmark"],
+            horizontal=True,
+            key="indian_metal_market",
+        )
+        if market == "IBJA Benchmark":
+            indian = prices.get("Indian")
+        else:
+            indian = prices.get("City", {}).get(market)
+
+        if indian is None:
+            source_error = (
+                prices.get("Indian error")
+                if market == "IBJA Benchmark"
+                else prices.get(f"{market} error", f"{market} rates are unavailable")
+            )
+            st.warning(f"{market} prices are unavailable: {source_error}.")
+        else:
+            gold_24k_col, gold_22k_col, silver_col = st.columns(3)
+            gold_24k_col.metric("Gold - 24K", f"₹{indian['gold_24k_per_10g']:,.2f}/10g")
+            gold_22k_col.metric("Gold - 22K", f"₹{indian['gold_22k_per_10g']:,.2f}/10g")
+            silver_col.metric("Silver - 999", f"₹{indian['silver_per_10g']:,.2f}/10g")
+            if market == "IBJA Benchmark":
+                st.caption(
+                    "IBJA Indian bullion benchmark rates. Gold: 24K (999), 22K (916). "
+                    "Silver: 999. GST and making charges are excluded."
+                )
+            else:
+                st.caption(
+                    f"Indicative {market} city-market retail rates for today. "
+                    "Rates exclude GST, TCS, making charges and dealer levies."
+                )
+
+            history = indian["history"]
+            if history.empty or history.drop(columns="Date").dropna(how="all").empty:
+                st.warning(f"No published {market} history is available for the last 15 calendar days.")
+            else:
+                missing = []
+                today = datetime.now(INDIA_TIME).date()
+                for name, title, axis_title in (
+                    ("24K Gold", "24K Gold", "Gold (₹ per 10g)"),
+                    ("Silver", "Silver", "Silver (₹ per 10g)"),
+                ):
+                    points = history.dropna(subset=[name])
+                    if len(points) < 15:
+                        missing.append(f"{name}: {len(points)}/15")
+                    if points.empty:
+                        continue
+                    chart = go.Figure()
+                    chart.add_trace(go.Scatter(
+                        x=points["Date"].tolist(), y=points[name].tolist(), mode="lines+markers",
+                        name=name,
+                    ))
+                    chart.update_layout(
+                        title=f"{market} - {title} - Last 15 Calendar Days",
+                        xaxis_title="Date",
+                        xaxis=dict(range=[today - timedelta(days=14), today]),
+                        yaxis_title=axis_title,
+                        height=420,
+                    )
+                    st.plotly_chart(chart, width="stretch")
+                if missing:
+                    st.caption(
+                        "Published observations in the last 15 calendar days: "
+                        + ", ".join(missing)
+                        + ". Missing dates are not estimated; lines connect available observations."
+                    )
+                if market == "IBJA Benchmark":
+                    st.caption("Chart uses IBJA's published PM benchmark rates, excluding GST.")
+        render_metal_news("INR")
+    with etf_tab:
+        st.caption(
+            f"ETF market closing prices from Yahoo Finance. Price data fetched: {fetched_at}"
+        )
+        etfs = prices["ETFs"]
+        etf_names = tuple(METAL_ETF_SYMBOLS)
+        selected_etf = st.radio(
+            "Select ETF",
+            etf_names,
+            horizontal=True,
+            key="selected_etf_details",
+        )
+        etf = etfs.get(selected_etf)
+        if etf is None:
+            st.metric(selected_etf, "Unavailable")
+            st.warning(f"{selected_etf} is unavailable: {prices['ETF errors'][selected_etf]}")
+        else:
+            st.metric(selected_etf, f"₹{etf['price']:,.2f}")
+            st.caption(f"Latest close: {etf['latest_session'].strftime('%d %b %Y')}")
+
+        st.divider()
+        st.subheader("ETF Fund Details")
+        try:
+            with st.spinner(f"Loading {selected_etf} fund details..."):
+                details = cached_etf_fund_details(METAL_ETF_SYMBOLS[selected_etf])
+        except StockDataError as exc:
+            st.warning(str(exc))
+        else:
+            sources = list(dict.fromkeys(details["sources"].values()))
+            if sources:
+                st.caption("Source: " + "; ".join(sources))
+            detail_columns = st.columns(4)
+            for column, (label, value) in zip(detail_columns, details["metrics"].items()):
+                column.metric(label, value)
+            for warning in details["warnings"]:
+                st.warning(warning)
+            st.caption(
+                f"Fund details fetched: {details['fetched_at'].strftime('%d %b %Y, %I:%M:%S %p %Z')}. "
+                "Fundamentals reporting date is not supplied by these sources. Groww average "
+                "volume uses 1 month; Yahoo uses its available average-volume period. "
+                "Missing values are not estimated."
+            )
+        if etf is not None:
+            chart = go.Figure()
+            chart.add_trace(go.Scatter(
+                x=etf["history"].index,
+                y=etf["history"].values,
+                mode="lines+markers",
+                name=selected_etf,
+            ))
+            chart.update_layout(
+                title=f"{selected_etf} ({etf['symbol']}) - Last 15 Trading Sessions",
+                xaxis_title="Date",
+                yaxis_title="ETF market price (₹ per unit)",
+                height=420,
+            )
+            st.plotly_chart(chart, width="stretch")
+    st.caption(
+        "Sources: Yahoo Finance futures and ETF quotes (USD and ETF tabs), IBJA benchmark "
+        "and Good Returns Hyderabad/Delhi city rates (INR tab). Cached up to 15 minutes."
+    )
+
+
 def render_institutional_tab():
     st.subheader("Top 20 stocks with increasing FII/DII holdings")
     st.caption(
@@ -1463,6 +2064,7 @@ notification_credentials = render_notification_sidebar()
     quality_screen_tab,
     ipo_screen_tab,
     institutional_tab,
+    metal_prices_tab,
 ) = st.tabs(
     [
         "Stock Analysis",
@@ -1473,6 +2075,7 @@ notification_credentials = render_notification_sidebar()
         "Quality Screen",
         "IPO Screening",
         "FII/DII buying stock",
+        "Gold & Silver Price",
     ],
     key="main_tab",
     on_change="rerun",
@@ -1494,3 +2097,5 @@ with ipo_screen_tab:
     render_ipo_screen_tab()
 with institutional_tab:
     render_institutional_tab()
+with metal_prices_tab:
+    render_metal_prices_tab()

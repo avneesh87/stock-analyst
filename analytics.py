@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from io import StringIO
 import math
 import re
@@ -15,6 +16,7 @@ import requests
 import yfinance as yf
 from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 from yfinance.exceptions import YFException
+from news_sources import NEWS_PUBLISHERS, financial_news_publisher
 
 
 NSE_NIFTY_50_URL = (
@@ -205,6 +207,68 @@ def get_news(symbol: str, limit: int = 8) -> list[dict[str, str]]:
         }
         for entry in feed.entries[:limit]
     ]
+
+
+def get_stock_news(symbol: str, limit: int = 8) -> list[dict[str, str]]:
+    """Return recent company-matched headlines from established financial publishers."""
+    normalized = normalize_symbol(symbol)
+    ticker = normalized.rsplit(".", 1)[0]
+    company = next(
+        (name for code, name, _ in FALLBACK_NIFTY_50 if code == ticker), ticker
+    )
+    if company == ticker and normalized.endswith(".NS"):
+        universe, _ = get_all_nse_equities()
+        matches = universe[universe["Symbol"] == ticker]
+        if not matches.empty:
+            company = str(matches.iloc[0]["Company Name"])
+    company = re.sub(r"\s+(limited|ltd\.?|inc\.?)$", "", company, flags=re.IGNORECASE).strip()
+    aliases = [company]
+    if len(ticker) >= 3 and ticker.lower() not in company.lower().split():
+        aliases.append(ticker)
+    query = "(" + " OR ".join(f'"{alias}"' for alias in aliases) + ")"
+    query += " (shares OR stock OR earnings OR results OR company) when:30d "
+    query += "(" + " OR ".join(f"site:{domain}" for domain in NEWS_PUBLISHERS) + ")"
+    try:
+        response = requests.get(
+            "https://news.google.com/rss/search",
+            params={"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
+            timeout=15,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise StockDataError(f"Could not retrieve news: {exc}") from exc
+
+    feed = feedparser.parse(response.content)
+    if feed.bozo and not feed.entries:
+        raise StockDataError("The stock news feed could not be parsed.")
+    now = datetime.now(timezone.utc)
+    news = []
+    seen = set()
+    for entry in feed.entries:
+        title = entry.get("title", "").strip()
+        headline = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+        if not any(
+            re.search(r"\b" + re.escape(re.sub(r"[^a-z0-9]+", " ", alias.lower()).strip()) + r"\b", headline)
+            for alias in aliases
+        ):
+            continue
+        link = entry.get("link", "")
+        publisher = financial_news_publisher(entry.get("source", {}).get("href", ""), link)
+        if publisher is None or not link.startswith(("http://", "https://")) or link in seen:
+            continue
+        try:
+            published = parsedate_to_datetime(entry.get("published", ""))
+        except (TypeError, ValueError):
+            continue
+        if published.tzinfo is None or not now - timedelta(days=30) <= published <= now:
+            continue
+        seen.add(link)
+        news.append({
+            "title": title, "link": link,
+            "published": published.isoformat(), "publisher": publisher,
+        })
+    news.sort(key=lambda item: datetime.fromisoformat(item["published"]), reverse=True)
+    return news[:limit]
 
 
 def headline_sentiment(title: str) -> tuple[str, int]:
