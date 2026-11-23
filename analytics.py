@@ -1252,6 +1252,10 @@ def _quality_fundamentals(
     if not 70 <= (periods[0] - periods[1]).days <= 110:
         return None, f"{symbol}: latest reported periods are not consecutive quarters"
 
+    latest_period = pd.Timestamp(periods[0]).strftime("%b %Y")
+    previous_period = pd.Timestamp(periods[1]).strftime("%b %Y")
+    quarter_comparison = f"{latest_period} vs {previous_period}"
+
     sales_growth = (sales[0] / sales[1] - 1) * 100 if sales[1] else None
     profit_growth = (profits[0] - profits[1]) / abs(profits[1]) * 100 if profits[1] else None
     technical_score = float(technical_row["Technical Score"])
@@ -1280,6 +1284,7 @@ def _quality_fundamentals(
             "Industry": industry,
             "Price": technical_row["Price"],
             "Market Cap (Cr)": market_cap_crore,
+            "QoQ Comparison": quarter_comparison,
             "Sales QoQ %": sales_growth,
             "Profit QoQ %": profit_growth,
             "RSI": technical_row["RSI"],
@@ -1331,6 +1336,7 @@ def screen_quality_stocks(
         "Industry",
         "Price",
         "Market Cap (Cr)",
+        "QoQ Comparison",
         "Sales QoQ %",
         "Profit QoQ %",
         "RSI",
